@@ -55,3 +55,76 @@ size_t base58check_encode(const uint8_t* payload, size_t payload_len, char* out,
 
     return base58_encode(buf, payload_len + 4, out, outlen);
 }
+
+// =====================================================
+// Base58 decode (raw)
+// =====================================================
+int base58_decode(const char* in, uint8_t* out, size_t* out_len) {
+    size_t len = strlen(in);
+    size_t zeroes = 0;
+
+    // Count leading '1'
+    while (zeroes < len && in[zeroes] == '1') zeroes++;
+
+    size_t size = (len - zeroes) * 733 / 1000 + 1; // log(58)/log(256) ¡Ö 0.733
+    uint8_t buf[size];
+    memset(buf, 0, size);
+
+    for (size_t i = zeroes; i < len; i++) {
+        const char* p = strchr(BASE58, in[i]);
+        if (!p) return 0; // invalid char
+        int carry = p - BASE58;
+
+        for (int j = size - 1; j >= 0; j--) {
+            carry += 58 * buf[j];
+            buf[j] = carry % 256;
+            carry /= 256;
+        }
+        if (carry != 0) return 0; // overflow
+    }
+
+    // Skip leading zeroes in decoded buffer
+    size_t j = 0;
+    while (j < size && buf[j] == 0) j++;
+
+    size_t decoded_len = zeroes + (size - j);
+    if (*out_len < decoded_len) return 0; // no enough space
+
+    // Write leading zeros
+    memset(out, 0, zeroes);
+
+    // Copy rest
+    memcpy(out + zeroes, buf + j, size - j);
+
+    *out_len = decoded_len;
+    return 1;
+}
+
+// =====================================================
+// Base58Check decode
+// =====================================================
+// Returns payload length (without version & checksum)
+size_t base58check_decode(const char* input, uint8_t* payload_out, size_t payload_max_len) {
+    uint8_t tmp[128];
+    size_t tmplen = sizeof(tmp);
+
+    // Base58 decode raw bytes
+    if (!base58_decode(input, tmp, &tmplen)) return 0;
+
+    if (tmplen < 4) return 0; // must at least contain checksum
+
+    // Extract checksum
+    uint8_t check1[32];
+    double_sha256(tmp, tmplen - 4, check1);
+
+    if (memcmp(check1, tmp + tmplen - 4, 4) != 0) {
+        return 0; // checksum mismatch
+    }
+
+    // Payload = raw - checksum
+    size_t payload_len = tmplen - 4;
+    if (payload_len > payload_max_len) return 0;
+
+    memcpy(payload_out, tmp, payload_len);
+    return payload_len;
+}

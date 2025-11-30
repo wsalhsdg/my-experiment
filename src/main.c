@@ -2,73 +2,161 @@
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
-
+#include "wallet/wallet.h"
 #include "core/block.h"
 #include "core/transaction.h"
 #include "core/utxo_set.h"
-#include "utils/hex.h"
-#include "crypto/sha256.h"
-#include "crypto/double_sha256.h"
-#include "crypto/ripemd160.h"
-#include "crypto/base58.h"
-#include "crypto/crypto_tools.h"
+#include "core/tx_pool.h"
 
-int main() {
+int main()
+{
+    printf("==== Bitcoin Mini Project ====\n\n");
 
-    printf("=== My Bitcoin Node (Minimal) ===\n");
+    //
+    // 1. 初始化交易池与 UTXO 集合
+    //
+    TxPool pool;
+    txpool_init(&pool);
 
-    // 初始化 UTXO 集
-    UTXOSet set;
-    utxo_init(&set);
+    UTXOSet utxo;
+    utxo_set_init(&utxo);
 
+    printf("Initialized TxPool and UTXOSet.\n");
 
-
-    uint8_t pubkeys[2][33] = {
-        {0x03,0x1d,0xb2,0x7a,0xe3,0x3a,0x4f,0x89,0x57,0x1a,0x2b,0x7c,0x9d,0x0f,0x4e,0xac,
-         0x3b,0xd0,0xe7,0x11,0x2a,0x7f,0xc1,0x45,0x98,0x5e,0xab,0x23,0x61,0x0f,0x9d,0x7c,0x01},
-        {0x02,0x1c,0xa2,0x5b,0xf3,0x4a,0x7c,0x91,0x47,0x2a,0x3d,0x6c,0x8d,0x1f,0x2e,0xbc,
-         0x4b,0xc0,0xd7,0x01,0x3a,0x6f,0xd1,0x35,0x88,0x4f,0xbb,0x33,0x51,0x1f,0x8d,0x6c,0x02}
+    //
+    // 2. 创建 coinbase 交易 tx1
+    //
+    TxOut outs1[2] = {
+        {.value = 5000000000ULL, .address = "Alice"},
+        {.value = 1000000000ULL, .address = "Bob"}
     };
 
-    uint64_t values[2] = { 5000000000ULL, 2000000000ULL }; // 50 BTC + 20 BTC
+    uint8_t ZERO_PREV[TXID_LEN] = { 0 };
 
-    Transaction tx;
-    transaction_init(&tx, 1, values, pubkeys, 2);
+    Transaction tx1;
+    transaction_init(&tx1, ZERO_PREV, 0, outs1, 2);
+    transaction_compute_txid(&tx1);
 
-    for (size_t i = 0; i < tx.outputCount; i++) {
-        printf("Output %zu:\n", i);
-        printf("  Value: %llu\n", (unsigned long long)tx.outputs[i].value);
-        printf("  Address: %s\n", tx.outputs[i].address);
-        printf("  scriptPubKey: ");
-        for (size_t j = 0; j < tx.outputs[i].scriptLen; j++) printf("%02x", tx.outputs[i].scriptPubKey[j]);
-        printf("\n");
-    }
+    printf("\nCreated transaction tx1:\n");
+    transaction_print(&tx1);
 
-    uint8_t txid[32];
-    tx_hash(&tx, txid);
+    //
+    // 3. 把 tx1 添加到交易池（会自动识别为 coinbase）
+    //
+    printf("\nAdding tx1 to TxPool...\n");
+    txpool_add(&pool, &tx1, &utxo);
 
-    char hex_txid[65] = { 0 };
-    for (int i = 0; i < 32; i++) sprintf(hex_txid + i * 2, "%02x", txid[i]);
-    printf("Transaction hash (TxID) = %s\n", hex_txid);
+    //
+    // 4. 更新 UTXO（放入 tx1 的输出）
+    //
+    printf("Applying tx1 to UTXO...\n");
+    utxo_set_update_from_tx(&utxo, &tx1);
 
+    //
+    // 5. 创建 tx2，花费 tx1 的 vout = 0（Alice 的那笔）
+    //
+    TxOut outs2[1] = {
+        {.value = 2000000000ULL, .address = "Charlie"}
+    };
 
+    Transaction tx2;
+    transaction_init(&tx2, tx1.txid, 0, outs2, 1);
+    transaction_compute_txid(&tx2);
 
+    printf("\nCreated transaction tx2:\n");
+    transaction_print(&tx2);
 
-    // 添加到 UTXO 集
-    utxo_add(&set, &tx);
+    //
+    // 6. 现在 utxo 中已经包含 tx1 的输出，因此 tx2 能顺利加入交易池
+    //
+    printf("\nAdding tx2 to TxPool...\n");
+    txpool_add(&pool, &tx2, &utxo);
 
-    // 生成区块
-    Block blk = { 0 };
-    blk.version = 1;
-    blk.timestamp = (uint32_t)time(NULL);
-    blk.tx = tx;
+    //
+    // 7. 应用 tx2 更新 UTXO
+    //
+    printf("Applying tx2 to UTXO...\n");
+    utxo_set_update_from_tx(&utxo, &tx2);
 
-    uint8_t blk_hash[32];
-    block_hash(&blk, blk_hash); 
+    //
+    // 8. 打印交易池
+    //
+    printf("\n===== TxPool =====\n");
+    txpool_print(&pool);
+    printf("\n=== Balance Check ===\n");
+    printf("Alice:   %llu\n", (unsigned long long)utxo_set_get_balance(&utxo, "Alice"));
+    printf("Bob:     %llu\n", (unsigned long long)utxo_set_get_balance(&utxo, "Bob"));
+    printf("Charlie: %llu\n", (unsigned long long)utxo_set_get_balance(&utxo, "Charlie"));
 
-    char hex_blk[65] = { 0 };
-    bytes_to_hex(blk_hash, 32, hex_blk);
-    printf("Block hash = %s\n", hex_blk);
+    //
+    // 9. 打印最终 UTXO 集合
+    //
+    printf("\n===== Final UTXO Set =====\n");
+    utxo_set_print(&utxo);
 
+    printf("\nDone.\n");
     return 0;
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*
+int main() {
+    // 初始化钱包
+    Wallet w1, w2;
+    wallet_create(&w1);
+    wallet_create(&w2);
+
+    printf("=== Wallets ===\n");
+    wallet_print(&w1);
+    wallet_print(&w2);
+
+    // 初始化 UTXO 集
+    UTXOSet utxos;
+    utxo_set_init(&utxos);
+
+    // 给 w1 一个初始 UTXO（创世块模拟奖励）
+    UTXO coinbase_utxo;
+    memset(&coinbase_utxo, 0, sizeof(coinbase_utxo));
+    coinbase_utxo.value = 5000000000; // 50 BTC
+    coinbase_utxo.vout = 0;
+    memset(coinbase_utxo.txid, 0x01, TXID_LEN); // 模拟创世交易ID
+    strncpy(coinbase_utxo.address, w1.address, ADDR_LEN - 1);
+    coinbase_utxo.address[ADDR_LEN - 1] = '\0';
+    coinbase_utxo.address[ADDR_LEN - 1] = '\0';
+    utxo_set_add(&utxos, &coinbase_utxo);
+
+    printf("\nInitial UTXO set:\n");
+    utxo_set_print(&utxos);
+
+    // 构造一笔交易：w1 -> w2
+    TxOut outputs[1];
+    outputs[0].value = 3000000000; // 30 BTC
+    strncpy(outputs[0].address, w2.address, BTC_ADDRESS_MAXLEN - 1);
+    outputs[0].address[BTC_ADDRESS_MAXLEN - 1] = '\0';
+
+    Transaction tx;
+    transaction_init(&tx, coinbase_utxo.txid, coinbase_utxo.vout, outputs, 1);
+    transaction_compute_txid(&tx);
+
+    printf("\nTransaction created:\n");
+    transaction_print(&tx);
+
+    // 更新 UTXO 集
+    utxo_set_update_from_tx(&utxos, &tx);
+
+    printf("\nUTXO set after transaction:\n");
+    utxo_set_print(&utxos);
+
+    return 0;
+}*/

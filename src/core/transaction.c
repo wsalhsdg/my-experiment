@@ -1,87 +1,73 @@
 #include "transaction.h"
-#include "../crypto/double_sha256.h"
 #include <string.h>
+#include <stdio.h>
+#include <openssl/sha.h>
 
-// 构造 TxOut
-void txout_init(TxOut* txout, uint64_t value, const uint8_t pubkey[33]) {
-    txout->value = value;
 
-    uint8_t h160[20];
-    hash160(pubkey, 33, h160);
-
-    uint8_t* p = txout->scriptPubKey;
-    p[0] = 0x76;  // OP_DUP
-    p[1] = 0xa9;  // OP_HASH160
-    p[2] = 0x14;  // Push 20 bytes
-    memcpy(p + 3, h160, 20);
-    p[23] = 0x88; // OP_EQUALVERIFY
-    p[24] = 0xac; // OP_CHECKSIG
-    txout->scriptLen = 25;
-
-    pubkey_to_address(pubkey, txout->address);
+static void sha256d(const uint8_t* data, size_t len, uint8_t out[TXID_LEN]) {
+    uint8_t tmp[TXID_LEN];
+    SHA256(data, len, tmp);
+    SHA256(tmp, TXID_LEN, out);
 }
 
-// 初始化 TxIn (占位)
-void txin_init(TxIn* txin) {
-    memset(txin->prev_txid, 0, 32);
-    txin->vout = 0;
-    txin->scriptSig[0] = 0x00;
-    txin->scriptLen = 1;
-    txin->sequence = 0xffffffff;
-}
+// 初始化交易
+void transaction_init(Transaction* tx,
+    const uint8_t prev_txid[TXID_LEN],
+    uint32_t vout,
+    const TxOut* outputs,
+    size_t output_count) {
+    memset(tx, 0, sizeof(Transaction));
+    if (prev_txid) {
+        memcpy(tx->prev_txid, prev_txid, TXID_LEN);
+    }
+    tx->vout = vout;
 
-// 初始化 Transaction (单输入 + 多输出)
-void transaction_init(Transaction* tx, uint32_t version, uint64_t* values, const uint8_t pubkeys[][33], size_t n_outputs) {
-    tx->version = version;
-    tx->inputCount = 1;
-    txin_init(&tx->input);
-
-    tx->outputCount = n_outputs;
-    for (size_t i = 0; i < n_outputs; i++) {
-        txout_init(&tx->outputs[i], values[i], pubkeys[i]);
+    if (outputs && output_count <= MAX_TX_OUTPUTS) {
+        tx->output_count = output_count;
+        for (size_t i = 0; i < output_count; i++) {
+            tx->outputs[i] = outputs[i];
+        }
     }
 
-    tx->locktime = 0;
+    // 计算交易ID
+    transaction_compute_txid(tx);
 }
 
-// 序列化并计算 TxID
-void tx_hash(const Transaction* tx, uint8_t out[32]) {
-    uint8_t buf[2048]; // 足够存储多输出
+// 计算 TxID
+void transaction_compute_txid(Transaction* tx) {
+    uint8_t buf[1024] = { 0 };
     size_t offset = 0;
 
-    // version
-    memcpy(buf + offset, &tx->version, 4);
-    offset += 4;
+    memcpy(buf + offset, tx->prev_txid, TXID_LEN);
+    offset += TXID_LEN;
 
-    // input count
-    buf[offset++] = (uint8_t)tx->inputCount;
+    memcpy(buf + offset, &tx->vout, sizeof(tx->vout));
+    offset += sizeof(tx->vout);
 
-    // TxIn
-    memcpy(buf + offset, tx->input.prev_txid, 32);
-    offset += 32;
-    memcpy(buf + offset, &tx->input.vout, 4);
-    offset += 4;
-    buf[offset++] = (uint8_t)tx->input.scriptLen;
-    memcpy(buf + offset, tx->input.scriptSig, tx->input.scriptLen);
-    offset += tx->input.scriptLen;
-    memcpy(buf + offset, &tx->input.sequence, 4);
-    offset += 4;
-
-    // output count
-    buf[offset++] = (uint8_t)tx->outputCount;
-
-    // TxOuts
-    for (size_t i = 0; i < tx->outputCount; i++) {
-        memcpy(buf + offset, &tx->outputs[i].value, 8);
-        offset += 8;
-        buf[offset++] = (uint8_t)tx->outputs[i].scriptLen;
-        memcpy(buf + offset, tx->outputs[i].scriptPubKey, tx->outputs[i].scriptLen);
-        offset += tx->outputs[i].scriptLen;
+    for (size_t i = 0; i < tx->output_count; i++) {
+        memcpy(buf + offset, &tx->outputs[i].value, sizeof(uint64_t));
+        offset += sizeof(uint64_t);
+        memcpy(buf + offset, tx->outputs[i].address, BTC_ADDRESS_MAXLEN);
+        offset += BTC_ADDRESS_MAXLEN;
     }
 
-    // locktime
-    memcpy(buf + offset, &tx->locktime, 4);
-    offset += 4;
+    sha256d(buf, offset, tx->txid);
+}
 
-    double_sha256(buf, offset, out);
+// 打印交易
+void transaction_print(const Transaction* tx) {
+    printf("Transaction:\n");
+    printf("  Input: prev_txid=");
+    for (int i = 0; i < TXID_LEN; i++) printf("%02x", tx->prev_txid[i]);
+    printf(", vout=%u\n", tx->vout);
+
+    printf("  Outputs (%zu):\n", tx->output_count);
+    for (size_t i = 0; i < tx->output_count; i++) {
+        printf("    [%zu] value=%llu, address=%s\n",
+            i, (unsigned long long)tx->outputs[i].value, tx->outputs[i].address);
+    }
+
+    printf("  TxID: ");
+    for (int i = 0; i < TXID_LEN; i++) printf("%02x", tx->txid[i]);
+    printf("\n");
 }
