@@ -1,13 +1,183 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
 #include <time.h>
+#include <unistd.h>     // read(), close()
+#include <fcntl.h>      // open(), O_RDONLY
+#include <sys/types.h>
+#include <sys/stat.h>
 #include "wallet/wallet.h"
 #include "core/block.h"
 #include "core/transaction.h"
 #include "core/utxo_set.h"
 #include "core/tx_pool.h"
+#include "crypto/crypto_tools.h"
+#include <secp256k1.h>
 
+// 随机生成私钥（32字节）
+void random_privkey(uint8_t priv[32]) {
+    secp256k1_context* ctx = crypto_secp_get_context();
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) {
+        // fallback to rand (非理想)
+        do {
+            for (int i = 0; i < 32; i++) priv[i] = rand() & 0xFF;
+        } while (!secp256k1_ec_seckey_verify(ctx, priv));
+        return;
+    }
+
+    do {
+        ssize_t r = read(fd, priv, 32);
+        if (r != 32) {
+            // fallback to rand
+            for (int i = 0; i < 32; i++) priv[i] = rand() & 0xFF;
+        }
+    } while (!secp256k1_ec_seckey_verify(ctx, priv));
+
+    close(fd);
+}
+
+int main() {
+    srand((unsigned)time(NULL));
+
+    secp256k1_context* ctx =
+        secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    crypto_secp_set_context(ctx);
+
+    printf("==== test ====\n\n");
+
+    // -----------------------------------------
+    // 1. 生成用户钱包：Alice & Bob
+    // -----------------------------------------
+    uint8_t privA[32], privB[32];
+    uint8_t pubA[33], pubB[33];
+    char addrA[BTC_ADDRESS_MAXLEN];
+    char addrB[BTC_ADDRESS_MAXLEN];
+
+    random_privkey(privA);
+    random_privkey(privB);
+
+    ecdsa_get_pubkey(privA, pubA);
+    ecdsa_get_pubkey(privB, pubB);
+
+    pubkey_to_address(pubA, addrA);
+    pubkey_to_address(pubB, addrB);
+
+    printf("Alice Address = %s\n", addrA);
+    printf("Bob   Address = %s\n\n", addrB);
+
+    // -----------------------------------------
+    // 2. 初始化模块
+    // -----------------------------------------
+    UTXOSet utxos;
+    utxo_set_init(&utxos);
+
+    TxPool pool;
+    txpool_init(&pool);
+
+    // -----------------------------------------
+    // 3. 创建“创世UTXO”：给 Alice 50 BTC
+    // -----------------------------------------
+    Transaction coinbase;
+    uint8_t zero_txid[32] = { 0 };
+
+    TxOut out_cb = {
+        .value = 50ull * 100000000ull,   // 50 BTC
+    };
+    strncpy(out_cb.address, addrA, BTC_ADDRESS_MAXLEN);
+
+    transaction_init(&coinbase, zero_txid, 0, &out_cb, 1);
+
+    utxo_set_update_from_tx(&utxos, &coinbase);
+
+    printf("=== UTXO ===\n");
+    utxo_set_print(&utxos);
+
+    // -----------------------------------------
+    // 4. Alice → Bob 转账 20 BTC
+    // -----------------------------------------
+    Transaction tx1;
+
+    TxOut out1 = {
+        .value = 20ull * 100000000ull,
+    };
+    strncpy(out1.address, addrB, BTC_ADDRESS_MAXLEN);
+
+    // 找到 Alice 的 UTXO（唯一）
+    UTXO* u = utxo_set_find(&utxos, coinbase.txid, 0);
+    if (!u) {
+        printf("couldn't find UTXO，stop\n");
+        return 0;
+    }
+
+    transaction_init_with_change(&tx1, u->txid, u->vout, &out1, 1,u->value, addrA);
+
+    // Alice 进行签名
+    if (!transaction_sign(&tx1, privA)) {
+        printf("fail to sign transaction\n");
+        return 0;
+    }
+
+    printf("\n=== Alice→Bob tx ===\n");
+    transaction_print(&tx1);
+
+    // 验证
+    if (!transaction_verify(&tx1)) {
+        printf("fail to verify!\n");
+        return 0;
+    }
+
+    printf("successful signature verification √\n");
+
+    // -----------------------------------------
+    // 5. 将交易加入 TxPool（自动执行 UTXO 检查+签名验证）
+    // -----------------------------------------
+    if (!txpool_add(&pool, &tx1, &utxos)) {
+        printf("fail to join txpool！\n");
+        return 0;
+    }
+
+    printf("\n=== Txpool ===\n");
+    txpool_print(&pool);
+
+    // -----------------------------------------
+    // 6. 更新UTXO
+    // -----------------------------------------
+    utxo_set_update_from_tx(&utxos, &tx1);
+
+    printf("\n=== UTXO after tx1 ===\n");
+    utxo_set_print(&utxos);
+
+    // -----------------------------------------
+    // 7. 查询余额
+    // -----------------------------------------
+    printf("\n=== balance enquiry ===\n");
+    printf("Alice: %llu sat\n", (unsigned long long)utxo_set_get_balance(&utxos, addrA));
+    printf("Bob:   %llu sat\n", (unsigned long long)utxo_set_get_balance(&utxos, addrB));
+
+    return 0;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*
 int main()
 {
     printf("==== Bitcoin Mini Project ====\n\n");
@@ -97,7 +267,7 @@ int main()
     printf("\nDone.\n");
     return 0;
 }
-
+*/
 
 
 

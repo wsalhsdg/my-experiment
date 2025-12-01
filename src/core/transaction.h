@@ -22,6 +22,10 @@ typedef struct {
     uint32_t vout;                       // 输入引用的输出索引
     TxOut outputs[MAX_TX_OUTPUTS];       // 输出数组
     size_t output_count;                 // 输出数量
+    uint8_t pubkey[33];       // 压缩公钥
+    uint8_t signature[72];    // DER 编码签名（最大 72 字节）
+    size_t  sig_len;          // 签名实际长度
+
 } Transaction;
 
 // 初始化交易（指定输入和多个输出）
@@ -31,11 +35,24 @@ void transaction_init(Transaction* tx,
     const TxOut* outputs,
     size_t output_count);
 
+void transaction_init_with_change(Transaction* tx,
+    const uint8_t prev_txid[TXID_LEN],
+    uint32_t vout,
+    const TxOut* outputs,
+    size_t output_count,
+    uint64_t total_input_value,
+    const char* change_address);
+
 // 计算交易 TxID（double SHA256）
 void transaction_compute_txid(Transaction* tx);
 
 // 打印交易信息（调试用）
 void transaction_print(const Transaction* tx);
 
+// 使用私钥签名交易
+int transaction_sign(Transaction* tx, const uint8_t* privkey32);
+
+// 验证交易签名
+int transaction_verify(const Transaction* tx);
 
 

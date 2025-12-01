@@ -53,6 +53,21 @@ static int txpool_tx_validate(const Transaction* tx, const UTXOSet* utxos)
         return 0;
     }
 
+    // pubkey 是否与 UTXO 地址一致（P2PKH）
+    char addr_from_pubkey[BTC_ADDRESS_MAXLEN];
+    pubkey_to_address(tx->pubkey, addr_from_pubkey);
+
+    if (strcmp(addr_from_pubkey, input->address) != 0) {
+        printf("[TxPool] Invalid TX: pubkey does not match UTXO owner\n");
+        return 0;
+    }
+
+    // 验证签名是否正确
+    if (!transaction_verify(tx)) {
+        printf("[TxPool] Invalid TX: signature check failed\n");
+        return 0;
+    }
+
     // 计算所有输出金额
     uint64_t total_out = 0;
     for (size_t i = 0; i < tx->output_count; i++)
