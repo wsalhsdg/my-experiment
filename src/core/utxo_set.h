@@ -55,3 +55,14 @@ void utxo_set_update_from_tx(UTXOSet* utxos, const Transaction* tx);
  * 查询某地址的余额（所有 UTXO 的 value 求和）
  */
 uint64_t utxo_set_get_balance(const UTXOSet* utxos, const char* address);
+
+//选币功能
+int utxo_set_select(
+    const UTXOSet* utxos,
+    const char* address,
+    uint64_t amount_needed,
+    UTXO* selected,
+    size_t max_selected,
+    size_t* out_selected_count,
+    uint64_t* out_change
+);

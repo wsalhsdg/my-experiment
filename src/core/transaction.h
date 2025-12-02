@@ -9,6 +9,92 @@
 #define TXID_LEN 32
 #define MAX_TX_OUTPUTS 16
 
+#ifndef TXID_LEN
+#define TXID_LEN 32
+#endif
+
+#ifndef BTC_ADDRESS_MAXLEN
+#define BTC_ADDRESS_MAXLEN 64
+#endif
+
+#ifndef MAX_TX_OUTPUTS
+#define MAX_TX_OUTPUTS 16
+#endif
+
+#ifndef MAX_TX_INPUTS
+#define MAX_TX_INPUTS 16
+#endif
+
+#ifndef MAX_PUBKEY_LEN
+#define MAX_PUBKEY_LEN 33
+#endif
+
+#ifndef MAX_SIG_LEN
+#define MAX_SIG_LEN 128
+#endif
+
+typedef struct {
+    uint64_t value;
+    char address[BTC_ADDRESS_MAXLEN];
+} TxOut;
+
+/* 单个交易输入（引用一个 UTXO） */
+typedef struct {
+    uint8_t txid[TXID_LEN];
+    uint32_t vout;
+} TxIn;
+
+typedef struct {
+    size_t input_count;
+    TxIn inputs[MAX_TX_INPUTS];
+
+    size_t output_count;
+    TxOut outputs[MAX_TX_OUTPUTS];
+
+    /* 交易 id */
+    uint8_t txid[TXID_LEN];
+
+    /* 签名相关：每个输入对应一个公钥和一个签名（灵活支持每输入不同签名）*/
+    uint8_t pubkeys[MAX_TX_INPUTS][MAX_PUBKEY_LEN];
+    uint8_t signatures[MAX_TX_INPUTS][MAX_SIG_LEN];
+    size_t sig_lens[MAX_TX_INPUTS];
+} Transaction;
+
+/* 初始化多输入交易 (inputs 可以为 NULL 表示先不添加输入) */
+void transaction_init(Transaction* tx,
+    const TxIn* inputs,
+    size_t input_count,
+    const TxOut* outputs,
+    size_t output_count);
+
+/* 初始化带找零的多输入交易（total_input_value 为所有输入金额之和） */
+void transaction_init_with_change(Transaction* tx,
+    const TxIn* inputs,
+    size_t input_count,
+    const TxOut* outputs,
+    size_t output_count,
+    uint64_t total_input_value,
+    const char* change_address);
+
+/* 计算 txid（double SHA256） */
+void transaction_compute_txid(Transaction* tx);
+
+/* 打印交易（调试） */
+void transaction_print(const Transaction* tx);
+
+/* 对指定输入 index 生成签名消息（32字节） */
+void transaction_hash_for_sign(const Transaction* tx, size_t in_index, uint8_t out32[32]);
+
+/* 对交易的所有输入使用 privkey 签名（会为每个输入生成签名并写入 tx->signatures[in], pubkey[in]） */
+int transaction_sign(Transaction* tx, const uint8_t* privkey32);
+
+/* 验证交易：对每个输入使用 tx 中的 pubkey+signature 验证
+   返回 1 = 全部验证通过，0 = 有任意一个失败 */
+int transaction_verify(const Transaction* tx);
+
+
+
+/*
 // 单个交易输出
 typedef struct {
     uint64_t value;                      // 金额（聪）
@@ -56,3 +142,4 @@ int transaction_sign(Transaction* tx, const uint8_t* privkey32);
 int transaction_verify(const Transaction* tx);
 
 
+*/

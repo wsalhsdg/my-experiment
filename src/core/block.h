@@ -2,10 +2,12 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <time.h>
+#include "core/transaction.h"
 
 
 #define BLOCK_HASH_LEN 32
 #define MAX_BLOCKS 1024  // 最多存储区块数量
+#define MAX_TXS_PER_BLOCK 256
 
 // -----------------------------
 // 区块头
@@ -13,6 +15,7 @@
 typedef struct {
     uint32_t version;
     uint8_t prev_block[BLOCK_HASH_LEN]; // 前一个区块哈希
+    uint8_t merkle_root[BLOCK_HASH_LEN];// merkle root of transactions
     uint32_t timestamp;                 // Unix 时间戳
     uint32_t bits;                      // 难度目标
     uint32_t nonce;                     // 随机数（用于挖矿）
@@ -24,6 +27,8 @@ typedef struct {
 typedef struct {
     BlockHeader header;
     uint8_t block_hash[BLOCK_HASH_LEN]; // 区块自身哈希
+    size_t tx_count;
+    Transaction txs[MAX_TXS_PER_BLOCK];
 } Block;
 
 // -----------------------------
@@ -37,6 +42,8 @@ typedef struct {
 // -----------------------------
 // 区块函数接口
 // -----------------------------
+/* 计算区块的 Merkle Root（sha256d 节点哈希，复制最后一个在节点数为奇数时） */
+void compute_merkle_root(const Block* block, uint8_t out_merkle[BLOCK_HASH_LEN]);
 
 /**
  * 计算区块哈希（最简单版本：SHA256 双哈希区块头）

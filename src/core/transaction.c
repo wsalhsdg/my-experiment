@@ -5,6 +5,205 @@
 #include "crypto/crypto_tools.h"
 
 
+extern void sha256(const uint8_t* data, size_t len, uint8_t out32[32]);
+
+static void sha256d(const uint8_t* data, size_t len, uint8_t out[TXID_LEN]) {
+    uint8_t tmp[32];
+    sha256(data, len, tmp);
+    sha256(tmp, 32, out);
+}
+
+void transaction_init(Transaction* tx,
+    const TxIn* inputs,
+    size_t input_count,
+    const TxOut* outputs,
+    size_t output_count)
+{
+    if (!tx) return;
+    memset(tx, 0, sizeof(Transaction));
+
+    if (inputs && input_count > 0) {
+        if (input_count > MAX_TX_INPUTS) input_count = MAX_TX_INPUTS;
+        tx->input_count = input_count;
+        for (size_t i = 0; i < input_count; i++) {
+            tx->inputs[i] = inputs[i];
+        }
+    }
+
+    if (outputs && output_count > 0) {
+        if (output_count > MAX_TX_OUTPUTS) output_count = MAX_TX_OUTPUTS;
+        tx->output_count = output_count;
+        for (size_t i = 0; i < output_count; i++) {
+            tx->outputs[i] = outputs[i];
+        }
+    }
+
+    transaction_compute_txid(tx);
+}
+
+void transaction_init_with_change(Transaction* tx,
+    const TxIn* inputs,
+    size_t input_count,
+    const TxOut* outputs,
+    size_t output_count,
+    uint64_t total_input_value,
+    const char* change_address)
+{
+    transaction_init(tx, inputs, input_count, outputs, output_count);
+
+    uint64_t total_output = 0;
+    for (size_t i = 0; i < tx->output_count; i++) {
+        total_output += tx->outputs[i].value;
+    }
+
+    if (total_input_value > total_output && tx->output_count < MAX_TX_OUTPUTS) {
+        TxOut change;
+        memset(&change, 0, sizeof(change));
+        change.value = total_input_value - total_output;
+        if (change_address) {
+            strncpy(change.address, change_address, BTC_ADDRESS_MAXLEN - 1);
+            change.address[BTC_ADDRESS_MAXLEN - 1] = '\0';
+        }
+        tx->outputs[tx->output_count++] = change;
+    }
+
+    transaction_compute_txid(tx);
+}
+
+void transaction_compute_txid(Transaction* tx) {
+    if (!tx) return;
+
+    /* 将所有 inputs & outputs 序列化到 buffer，再做双 sha256 */
+    uint8_t buf[4096];
+    size_t off = 0;
+
+    // inputs
+    memcpy(buf + off, &tx->input_count, sizeof(tx->input_count));
+    off += sizeof(tx->input_count);
+
+    for (size_t i = 0; i < tx->input_count; i++) {
+        memcpy(buf + off, tx->inputs[i].txid, TXID_LEN);
+        off += TXID_LEN;
+        memcpy(buf + off, &tx->inputs[i].vout, sizeof(tx->inputs[i].vout));
+        off += sizeof(tx->inputs[i].vout);
+    }
+
+    // outputs
+    memcpy(buf + off, &tx->output_count, sizeof(tx->output_count));
+    off += sizeof(tx->output_count);
+
+    for (size_t i = 0; i < tx->output_count; i++) {
+        memcpy(buf + off, &tx->outputs[i].value, sizeof(tx->outputs[i].value));
+        off += sizeof(tx->outputs[i].value);
+        memcpy(buf + off, tx->outputs[i].address, BTC_ADDRESS_MAXLEN);
+        off += BTC_ADDRESS_MAXLEN;
+    }
+
+    // 计算 double-sha256
+    sha256d(buf, off, tx->txid);
+}
+
+void transaction_print(const Transaction* tx) {
+    if (!tx) return;
+
+    printf("Transaction:\n");
+    printf("  Inputs (%zu):\n", tx->input_count);
+    for (size_t i = 0; i < tx->input_count; i++) {
+        printf("    [%zu] txid=", i);
+        for (int j = 0; j < TXID_LEN; j++) printf("%02x", tx->inputs[i].txid[j]);
+        printf(", vout=%u\n", tx->inputs[i].vout);
+    }
+
+    printf("  Outputs (%zu):\n", tx->output_count);
+    for (size_t i = 0; i < tx->output_count; i++) {
+        printf("    [%zu] value=%llu, addr=%s\n", i, (unsigned long long)tx->outputs[i].value, tx->outputs[i].address);
+    }
+
+    printf("  TxID: ");
+    for (int i = 0; i < TXID_LEN; i++) printf("%02x", tx->txid[i]);
+    printf("\n");
+
+    // 简要打印每个输入的签名长度
+    for (size_t i = 0; i < tx->input_count; i++) {
+        printf("  Input[%zu] sig_len=%zu\n", i, tx->sig_lens[i]);
+    }
+}
+
+void transaction_hash_for_sign(const Transaction* tx, size_t in_index, uint8_t out32[32]) {
+    /* 简化的签名哈希：将整个 txid + 输入索引序列化并 sha256
+       实际比特币使用更复杂的 sighash 算法，这里为简化方便测试实现 */
+    if (!tx || in_index >= tx->input_count) {
+        memset(out32, 0, 32);
+        return;
+    }
+
+    uint8_t buf[128];
+    size_t off = 0;
+    // 使用 txid（已包含 inputs/outputs）+ 输入索引
+    memcpy(buf + off, tx->txid, TXID_LEN);
+    off += TXID_LEN;
+    memcpy(buf + off, &in_index, sizeof(in_index));
+    off += sizeof(in_index);
+
+    sha256d(buf, off, out32);
+}
+
+int transaction_sign(Transaction* tx, const uint8_t* privkey32) {
+    if (!tx || !privkey32) return 0;
+
+    // 为每个输入生成签名
+    for (size_t i = 0; i < tx->input_count; i++) {
+        // 计算哈希
+        uint8_t hash32[32];
+        transaction_hash_for_sign(tx, i, hash32);
+
+        // 获取公钥（压缩33字节）
+        if (!crypto_secp_get_pubkey(privkey32, tx->pubkeys[i])) {
+            printf("transaction_sign_all: failed to get pubkey for input %zu\n", i);
+            return 0;
+        }
+
+        size_t sig_len = 0;
+        if (!crypto_secp_sign(privkey32, hash32, tx->signatures[i], &sig_len)) {
+            printf("transaction_sign_all: failed to sign input %zu\n", i);
+            return 0;
+        }
+        if (sig_len > MAX_SIG_LEN) {
+            printf("transaction_sign_all: signature too long for input %zu\n", i);
+            return 0;
+        }
+        tx->sig_lens[i] = sig_len;
+    }
+
+    return 1;
+}
+
+int transaction_verify(const Transaction* tx) {
+    if (!tx) return 0;
+
+    for (size_t i = 0; i < tx->input_count; i++) {
+        uint8_t hash32[32];
+        transaction_hash_for_sign(tx, i, hash32);
+
+        const uint8_t* pub = tx->pubkeys[i];
+        const uint8_t* sig = tx->signatures[i];
+        size_t siglen = tx->sig_lens[i];
+
+        if (siglen == 0) {
+            printf("transaction_verify: missing signature for input %zu\n", i);
+            return 0;
+        }
+
+        if (!crypto_secp_verify(pub, hash32, sig, siglen)) {
+            printf("transaction_verify: signature verify failed for input %zu\n", i);
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+/*
 static void sha256d(const uint8_t* data, size_t len, uint8_t out[TXID_LEN]) {
     uint8_t tmp[TXID_LEN];
     sha256(data, len, tmp);
@@ -111,9 +310,7 @@ static void transaction_hash_for_sign(const Transaction* tx, uint8_t out32[32]) 
 }
 
 
-/*
-    签名交易（privkey32: 32 字节私钥）
-*/
+//      签名交易（privkey32: 32 字节私钥）
 int transaction_sign(Transaction* tx, const uint8_t* privkey32)
 {
 
@@ -145,9 +342,7 @@ int transaction_sign(Transaction* tx, const uint8_t* privkey32)
 }
 
 
-/*
-    验证交易签名
-*/
+//      验证交易签名
 int transaction_verify(const Transaction* tx)
 {
     uint8_t hash32[32];
@@ -161,3 +356,4 @@ int transaction_verify(const Transaction* tx)
         tx->sig_len
     );
 }
+*/

@@ -1,9 +1,9 @@
 # 编译器和选项
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -DUSE_SECP256K1 -I./src -I./secp256k1/include
+CFLAGS = -Wall -Wextra -O2 -DUSE_SECP256K1 -I./src -I./secp256k1/include -g
 
 # 静态库和外部库
-LIBS = ./secp256k1/lib/libsecp256k1.a -lssl -lcrypto
+LIBS = ./secp256k1/lib/libsecp256k1.a -lssl -lcrypto -lpthread
 
 # 源文件
 SRC = $(wildcard src/*.c src/*/*.c)
