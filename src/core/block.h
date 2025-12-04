@@ -39,6 +39,9 @@ typedef struct {
     size_t block_count;
 } Blockchain;
 
+//初始化，加入交易
+void block_init(Block* block);
+int block_add_transaction(Block* block, const Transaction* tx);
 // -----------------------------
 // 区块函数接口
 // -----------------------------
@@ -74,3 +77,5 @@ void blockchain_print(const Blockchain* chain);
 // 挖矿函数
 // 找到一个满足 difficulty 的 nonce，使得 block_hash 前 difficulty 个字节为 0
 void block_mine(Block* block, uint32_t difficulty);
+
+void create_coinbase_tx(Transaction* tx, const char* miner_address, uint64_t reward);

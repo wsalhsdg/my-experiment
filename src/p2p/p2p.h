@@ -13,7 +13,8 @@ typedef enum {
     MSG_PONG = 2,
     MSG_TX = 3,
     MSG_BLOCK = 4,
-    MSG_INV = 5
+    MSG_INV = 5,
+    
 } MessageType;
 
 // P2P ÏûÏ¢

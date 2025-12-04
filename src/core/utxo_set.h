@@ -4,7 +4,9 @@
 #include "core/transaction.h"
 
 #define MAX_UTXOS 1024
-#define ADDR_LEN 50
+#define ADDR_LEN 64
+
+
 
 typedef struct {
     uint8_t txid[TXID_LEN];    // ½»Ò×ID

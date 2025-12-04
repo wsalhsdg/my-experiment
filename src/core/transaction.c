@@ -203,6 +203,142 @@ int transaction_verify(const Transaction* tx) {
     return 1;
 }
 
+
+size_t transaction_serialize(const Transaction* tx, uint8_t* out, size_t maxlen)
+{
+    if (!tx || !out) return 0;
+
+    size_t off = 0;
+
+    // ---- 写 input_count ----
+    if (off + 1 > maxlen) return 0;
+    out[off++] = (uint8_t)tx->input_count;
+
+    // ---- 写 inputs ----
+    for (size_t i = 0; i < tx->input_count; i++) {
+
+        if (off + TXID_LEN + sizeof(uint32_t) > maxlen) return 0;
+
+        memcpy(out + off, tx->inputs[i].txid, TXID_LEN);
+        off += TXID_LEN;
+
+        memcpy(out + off, &tx->inputs[i].vout, sizeof(uint32_t));
+        off += sizeof(uint32_t);
+    }
+
+    // ---- 写 output_count ----
+    if (off + 1 > maxlen) return 0;
+    out[off++] = (uint8_t)tx->output_count;
+
+    // ---- 写 outputs ----
+    for (size_t i = 0; i < tx->output_count; i++) {
+
+        if (off + sizeof(uint64_t) + BTC_ADDRESS_MAXLEN > maxlen) return 0;
+
+        memcpy(out + off, &tx->outputs[i].value, sizeof(uint64_t));
+        off += sizeof(uint64_t);
+
+        memcpy(out + off, tx->outputs[i].address, BTC_ADDRESS_MAXLEN);
+        off += BTC_ADDRESS_MAXLEN;
+    }
+
+    // ---- 写每个输入的 pubkey + signature ----
+    for (size_t i = 0; i < tx->input_count; i++) {
+
+        uint16_t siglen = tx->sig_lens[i];
+
+        if (siglen > MAX_SIG_LEN) return 0;
+
+        if (off + MAX_PUBKEY_LEN + sizeof(uint16_t) + siglen > maxlen)
+            return 0;
+
+        memcpy(out + off, tx->pubkeys[i], MAX_PUBKEY_LEN);
+        off += MAX_PUBKEY_LEN;
+
+        memcpy(out + off, &siglen, sizeof(uint16_t));
+        off += sizeof(uint16_t);
+
+        memcpy(out + off, tx->signatures[i], siglen);
+        off += siglen;
+    }
+
+    return off;
+}
+
+
+/* 反序列化：按照同样顺序读取 */
+int transaction_deserialize(Transaction* tx, const uint8_t* data, size_t len)
+{
+    if (!tx || !data) return 0;
+
+    memset(tx, 0, sizeof(Transaction));
+
+    size_t off = 0;
+
+    // ---- input_count ----
+    if (off + 1 > len) return 0;
+    tx->input_count = data[off++];
+
+    if (tx->input_count > MAX_TX_INPUTS) return 0;
+
+    // ---- inputs ----
+    for (size_t i = 0; i < tx->input_count; i++) {
+
+        if (off + TXID_LEN + sizeof(uint32_t) > len) return 0;
+
+        memcpy(tx->inputs[i].txid, data + off, TXID_LEN);
+        off += TXID_LEN;
+
+        memcpy(&tx->inputs[i].vout, data + off, sizeof(uint32_t));
+        off += sizeof(uint32_t);
+    }
+
+    // ---- output_count ----
+    if (off + 1 > len) return 0;
+    tx->output_count = data[off++];
+
+    if (tx->output_count > MAX_TX_OUTPUTS) return 0;
+
+    // ---- outputs ----
+    for (size_t i = 0; i < tx->output_count; i++) {
+
+        if (off + sizeof(uint64_t) + BTC_ADDRESS_MAXLEN > len)
+            return 0;
+
+        memcpy(&tx->outputs[i].value, data + off, sizeof(uint64_t));
+        off += sizeof(uint64_t);
+
+        memcpy(tx->outputs[i].address, data + off, BTC_ADDRESS_MAXLEN);
+        off += BTC_ADDRESS_MAXLEN;
+    }
+
+    // ---- 公钥 + 签名 ----
+    for (size_t i = 0; i < tx->input_count; i++) {
+
+        if (off + MAX_PUBKEY_LEN + sizeof(uint16_t) > len) return 0;
+
+        memcpy(tx->pubkeys[i], data + off, MAX_PUBKEY_LEN);
+        off += MAX_PUBKEY_LEN;
+
+        uint16_t siglen = 0;
+        memcpy(&siglen, data + off, sizeof(uint16_t));
+        off += sizeof(uint16_t);
+
+        if (siglen > MAX_SIG_LEN) return 0;
+
+        if (off + siglen > len) return 0;
+
+        memcpy(tx->signatures[i], data + off, siglen);
+        off += siglen;
+
+        tx->sig_lens[i] = siglen;
+    }
+
+    // 最后重新计算 txid（保持一致）
+    transaction_compute_txid(tx);
+
+    return 1;
+}
 /*
 static void sha256d(const uint8_t* data, size_t len, uint8_t out[TXID_LEN]) {
     uint8_t tmp[TXID_LEN];

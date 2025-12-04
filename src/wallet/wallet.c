@@ -142,27 +142,42 @@ int wallet_load_keystore(Wallet* w, const char* path) {
     if (!f) return -1;
     // ½âÎö JSON
     char buf[512];
+    char address[64] = { 0 };
     char keyhex[WALLET_KEY_HEX_LEN + 1] = { 0 };
     while (fgets(buf, sizeof(buf), f)) {
-        char* p = strstr(buf, "\"privkey_hex\"");
-        if (p) {
-            char* q = strchr(buf, ':');
-            if (!q) continue;
-            q++;
-            while (*q == ' ' || *q == '\"' || *q == '\t') q++;
-            char* end = q;
-            while (*end && *end != '\"' && *end != '\n' && *end != '\r' && *end != ',') end++;
-            size_t len = end - q;
-            if (len == WALLET_KEY_HEX_LEN) {
-                memcpy(keyhex, q, len);
-                keyhex[len] = '\0';
-                break;
-            }
+
+        // parse address
+        if (strstr(buf, "address")) {
+            sscanf(buf, " %*[^:] : \"%63[^\"]\"", address);
+        }
+
+        // parse privkey_hex
+        else if (strstr(buf, "privkey_hex")) {
+            sscanf(buf, " %*[^:] : \"%64[^\"]\"", keyhex);
         }
     }
+
     fclose(f);
-    if (keyhex[0] == '\0') return -2;
-    return wallet_privkey_from_hex(w, keyhex);
+
+    if (keyhex[0] == '\0') {
+        return -2; // no private key found
+    }
+
+    // load private key
+    if (wallet_privkey_from_hex(w, keyhex) != 0)
+        return -3;
+
+    // load address if present
+    if (address[0]) {
+        strlcpy(w->address, address, sizeof(w->address));
+
+    }
+    else {
+        // rebuild from pubkey
+        pubkey_to_address(w->pubkey, w->address);
+    }
+
+    return 0;
 }
 
 int wallet_sign(const Wallet* w, const uint8_t hash32[32],

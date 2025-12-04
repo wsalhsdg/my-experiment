@@ -92,6 +92,9 @@ int transaction_sign(Transaction* tx, const uint8_t* privkey32);
    返回 1 = 全部验证通过，0 = 有任意一个失败 */
 int transaction_verify(const Transaction* tx);
 
+/* 序列化 / 反序列化 */
+size_t transaction_serialize(const Transaction* tx, uint8_t* out, size_t maxlen);
+int transaction_deserialize(Transaction* tx, const uint8_t* data, size_t len);
 
 
 /*

@@ -34,7 +34,7 @@ int block_add_transaction(Block* block, const Transaction* tx) {
 
     /* Ensure txid is computed ¡ª transaction_compute_txid should exist */
     Transaction copy = *tx;
-    transaction_compute_txid(&copy);
+    //transaction_compute_txid(&copy);
 
     block->txs[block->tx_count++] = copy;
     return 0;
@@ -210,6 +210,22 @@ void blockchain_print(const Blockchain* chain) {
         printf("=== Block %zu ===\n", i);
         block_print(&chain->blocks[i]);
     }
+}
+
+void create_coinbase_tx(Transaction* tx, const char* miner_address, uint64_t reward) {
+    memset(tx, 0, sizeof(Transaction));
+
+    // Coinbase has zero inputs
+    tx->input_count = 0;
+
+    // One output: reward to miner
+    tx->output_count = 1;
+    tx->outputs[0].value = reward;
+
+    snprintf(tx->outputs[0].address, BTC_ADDRESS_MAXLEN, "%s", miner_address);
+
+    // Compute txid
+    transaction_compute_txid(tx);
 }
 
 /* Mining (proof-of-work): find nonce s.t. first `difficulty` bytes == 0 */

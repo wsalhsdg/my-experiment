@@ -16,6 +16,7 @@
 #include "p2p/p2p.h"
 #include <pthread.h>
 #include <secp256k1.h>
+#include <global/global.h>
 
 // 随机生成私钥（32字节）
 void random_privkey(uint8_t priv[32]) {
@@ -40,12 +41,424 @@ void random_privkey(uint8_t priv[32]) {
     close(fd);
 }
 
+// -----------------------------
+// 全局状态
+// -----------------------------
+//static Blockchain g_chain;
+//static UTXOSet g_utxos;
+//static TxPool g_txpool;
+//static Wallet g_wallet;
+//static int g_wallet_loaded = 0;
+//static P2PNetwork g_net;
+
+// -----------------------------
+// 功能函数
+// -----------------------------
+void show_blockchain() {
+    blockchain_print(&g_chain);
+}
+
+void show_utxo_set() {
+    utxo_set_print(&g_utxos);
+}
+
+void show_txpool() {
+    txpool_print(&g_txpool);
+}
+
+// 创建钱包
+void create_wallet() {
+    if (wallet_create(&g_wallet) == 0) {
+        printf("wallet created!addr:%s\n", g_wallet.address);
+        // save wallet
+        if (wallet_save_keystore(&g_wallet, "keystore.json") == 0) {
+            printf("Wallet saved to keystore.json\n");
+        }
+        else {
+            printf("Failed to save wallet to keystore.json\n");
+        }
+        g_wallet_loaded = 1;
+    }
+    else {
+        printf("fail to create wallet!\n");
+    }
+}
+
+// 加载钱包（从 keystore.json）
+void load_wallet() {
+    char path[256];
+    printf("Enter keystore path: ");
+    if (scanf("%s", path) != 1) {
+        printf("Invalid input!\n");
+        return;
+    }
+
+
+    if (wallet_load_keystore(&g_wallet, path) == 0) {
+        printf("Wallet loaded successfully! Address:%s\n", g_wallet.address);
+        g_wallet_loaded = 1;
+    }
+    else {
+        printf("Failed to load wallet!\n");
+    }
+}
+
+void show_wallet() {
+    if (!g_wallet_loaded) {
+        printf("Wallet not loaded！\n");
+        return;
+    }
+    wallet_print(&g_wallet);
+}
+
+// 查询余额
+void show_balance() {
+    if (!g_wallet_loaded) {
+        printf("Please create or load a wallet first!\n");
+        return;
+    }
+
+    uint64_t bal = utxo_set_get_balance(&g_utxos, g_wallet.address);
+    printf("Balance of %s: %lu satoshi\n", g_wallet.address, bal);
+}
+
+void create_transaction() {
+    if (!g_wallet_loaded) {
+        printf("Please create or load a wallet first!\n");
+        return;
+    }
+
+    char to_addr[64];
+    uint64_t amount;
+
+    printf("Enter receiver address:  ");
+    if (scanf("%63s", to_addr) != 1) {
+        printf("Invalid input!\n");
+        return;
+    }
+
+    printf("Enter amount (satoshi): ");
+    if (scanf("%lu", &amount) != 1) {
+        printf("Invalid input!\n");
+        return;
+    }
+
+
+    // ----- 1. 自动选币 -----
+    UTXO selected[16];
+    size_t selected_count = 0;
+    uint64_t change = 0;
+
+    if (utxo_set_select(&g_utxos, g_wallet.address, amount,
+        selected, 16, &selected_count, &change) != 0)
+    {
+        printf("Insufficient balance! Transaction failed.\n");
+        return;
+    }
+
+    printf("Selected %zu UTXOs, change = %lu\n", selected_count, change);
+
+
+    // ----- 2. 构建 TxIn -----
+    TxIn inputs[16];
+    uint64_t total_input_value = 0;
+
+    for (size_t i = 0; i < selected_count; i++) {
+        memcpy(inputs[i].txid, selected[i].txid, TXID_LEN);
+        inputs[i].vout = selected[i].vout;
+
+        total_input_value += selected[i].value;
+    }
+
+
+    // ----- 3. 构建 TxOut（主输出 + 找零输出） -----
+
+    TxOut outputs[2];
+    memset(outputs, 0, sizeof(outputs));
+
+    // 主输出
+    outputs[0].value = amount;
+    strlcpy(outputs[0].address, to_addr, BTC_ADDRESS_MAXLEN);
+
+    size_t out_count = 1;
+
+
+    // ----- 4. 创建 Transaction（自动加找零） -----
+    Transaction tx;
+    transaction_init_with_change(&tx,
+        inputs, selected_count,      // inputs
+        outputs, out_count,          // outputs
+        total_input_value,           // total input value
+        g_wallet.address             // change address
+    );
+
+
+    // ----- 5. 签名 -----
+    transaction_sign(&tx, g_wallet.privkey);
+
+    printf("Transaction created, TxID (first 4 bytes): ");
+    for (int i = 0; i < 4; i++) printf("%02x", tx.txid[i]);
+    printf("...\n");
+
+
+    // ----- 6. 加入交易池 -----
+    if (txpool_add(&g_txpool, &tx, &g_utxos)) {
+        printf("Transaction added to mempool.\n");
+    }
+    else {
+        printf("Failed to add transaction to mempool.\n");
+    }
+
+    // ----- 7. 广播 transaction 到 peers -----
+   // 构造消息：使用固定格式（Message 在 p2p.h 定义）
+    Message msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = MSG_TX;
+    msg.payload_len = sizeof(Transaction);
+    if (msg.payload_len > MSG_BUF_SIZE) {
+        printf("Transaction size too large to broadcast\n");
+        return;
+    }
+    memcpy(msg.payload, &tx, msg.payload_len);
+
+    // 广播（忽略失败）
+    p2p_broadcast(&g_net, &msg);
+
+    printf("Transaction broadcast to peers.\n");
+
+
+}
+
+// 挖矿：把交易池所有交易打包
+void mine_block() {
+    Block block;
+    block_init(&block);
+
+    printf("Start mining a new block...\n");
+
+    // 1. Add coinbase transaction
+    Transaction coinbase;
+    create_coinbase_tx(&coinbase, g_wallet.address, 5000000000ULL);  // 50 BTC
+    block_add_transaction(&block, &coinbase);
+
+    // Update UTXO with coinbase
+    utxo_set_update_from_tx(&g_utxos, &coinbase);
+
+    printf("Packing %zu transactions...\n", g_txpool.count);
+
+    for (size_t i = 0; i < g_txpool.count; i++) {
+        block_add_transaction(&block, &g_txpool.txs[i]);
+        // 更新 utxo
+        utxo_set_update_from_tx(&g_utxos, &g_txpool.txs[i]);
+    }
+
+    // 清空交易池
+    g_txpool.count = 0;
+
+    // 计算 Merkle root
+    compute_merkle_root(&block, block.header.merkle_root);
+
+    // 挖矿
+    block_mine(&block, 2);
+
+    // 添加区块
+    blockchain_add_block(&g_chain, &block);
+
+    printf("Block mined! Current height: %zu\n", g_chain.block_count);
+}
+
+// 启动 P2P 监听
+void p2p_start() {
+    p2p_init(&g_net);
+    printf("Enter listen port: ");
+    if (scanf("%hu", &g_net.listen_port) != 1) {
+        printf("Invalid input!\n");
+        return;
+    }
+
+
+    //p2p_init(&g_net);
+
+    pthread_t tid;
+    pthread_create(&tid, NULL, p2p_server_thread, &g_net);
+    pthread_detach(tid);
+
+    printf("P2P listener started.\n");
+}
+
+void p2p_connect() {
+    char ip[64];
+    uint16_t port;
+    printf("Enter peer IP:  ");
+    if (scanf("%s", ip) != 1) {
+        printf("Invalid input!\n");
+        return;
+    }
+
+    printf("Enter peer port: ");
+    if (scanf("%hu", &port) != 1) {
+        printf("Invalid input!\n");
+        return;
+    }
+
+
+    if (p2p_add_peer(&g_net, ip, port) == 0)
+        printf("Connected to peer.\n");
+    else
+        printf("Connection failed.\n");
+}
+
+// -----------------------------
+// 菜单界面
+// -----------------------------
+void print_menu() {
+    printf("====================================\n");
+    printf("        My Bitcoin Experiment       \n");
+    printf("====================================\n");
+    printf("1. Show blockchain\n");
+    printf("2. Create transaction\n");
+    printf("3. Mine block\n");
+    printf("4. Show UTXO set\n");
+    printf("5. Create wallet\n");
+    printf("6. Load wallet\n");
+    printf("7. Show wallet info\n");
+    printf("8. Show balance\n");
+    printf("9. Show mempool\n");
+    printf("10. Start P2P listener\n");
+    printf("11. Connect to peer\n");
+    printf("0. Exit\n");
+    printf("Select option: (1-11,0) ");
+}
+
 int main(int argc, char* argv[]) {
+    (void)argc; (void)argv;
     srand((unsigned)time(NULL));
 
     secp256k1_context* ctx =
         secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
     crypto_secp_set_context(ctx);
+
+    //Blockchain* g_chain = malloc(sizeof(Blockchain));
+    
+    blockchain_init(&g_chain);
+    utxo_set_init(&g_utxos);
+    txpool_init(&g_txpool);
+
+    int choice;
+
+    while (1) {
+        print_menu();
+        if (scanf("%d", &choice) != 1) {
+            while (getchar() != '\n');
+            printf("Invalid input!\n");
+            continue;
+        }
+
+        switch (choice) {
+        case 1: show_blockchain(); break;
+        case 2: create_transaction(); break;
+        case 3: mine_block(); break;
+        case 4: show_utxo_set(); break;
+        case 5: create_wallet(); break;
+        case 6: load_wallet(); break;
+        case 7: show_wallet(); break;
+        case 8: show_balance(); break;
+        case 9: show_txpool(); break;
+        case 10: p2p_start(); break;
+        case 11: p2p_connect(); break;
+        case 0:
+            printf("Exiting...\n");
+            return 0;
+        default:
+            printf("Invalid option!\n");
+        }
+
+        printf("\n");
+    }
+
+    /*printf("=== Integration test: minimal bitcoin demo ===\n\n");
+    // ============================
+    // 1. Create two wallets
+    // ============================
+    printf("=== 1. Create Wallets (Alice / Bob) ===\n");
+
+    Wallet alice, bob;
+
+    if (wallet_create(&alice) != 0) {
+        printf("Failed to create Alice wallet!\n");
+        return 1;
+    }
+    if (wallet_create(&bob) != 0) {
+        printf("Failed to create Bob wallet!\n");
+        return 1;
+    }
+
+    char alice_priv_hex[WALLET_KEY_HEX_LEN + 1];
+    char bob_priv_hex[WALLET_KEY_HEX_LEN + 1];
+
+    wallet_privkey_to_hex(&alice, alice_priv_hex);
+    wallet_privkey_to_hex(&bob, bob_priv_hex);
+
+    //printf("Alice Address = %s\n", alice.address);
+    //printf("Alice PrivKey = %s\n", alice_priv_hex);
+
+    //printf("Bob   Address = %s\n", bob.address);
+    //zheli printf("Bob   PrivKey = %s\n\n", bob_priv_hex);
+    // ============================
+    // 2. Initialize UTXO Set with genesis UTXOs
+    // ============================
+    printf("=== 2. Initialize UTXO Set (Genesis) ===\n");
+
+    UTXOSet utxos;
+    utxo_set_init(&utxos);
+
+    // ---- Simulate genesis: give Alice 50 BTC ----
+    UTXO g1 = { 0 };
+    // fake txid (32 bytes)
+    for (int i = 0; i < TXID_LEN; i++) g1.txid[i] = i;
+    g1.vout = 0;
+    g1.value = 50 * 100000000ULL;    // 50 BTC
+    strncpy(g1.address, alice.address, ADDR_LEN - 1);
+
+    utxo_set_add(&utxos, &g1);
+
+    //printf("Added genesis UTXO: 50 BTC to Alice\n\n");
+
+    // ---- Print UTXO set ----
+    //utxo_set_print(&utxos);
+
+    // ---- Show balances ----
+    uint64_t alice_bal = utxo_set_get_balance(&utxos, alice.address);
+    uint64_t bob_bal = utxo_set_get_balance(&utxos, bob.address);
+
+    //printf("\nAlice Balance = %.8f BTC\n", alice_bal / 100000000.0);
+    //printf("Bob   Balance = %.8f BTC\n\n", bob_bal / 100000000.0);
+    
+
+    printf("\n=== Demo finished ===\n");
+    */
+
+    return 0;
+}
+
+   /* Transaction tx; memset(&tx, 0, sizeof(tx));
+    tx.input_count = 1;
+    memset(tx.inputs[0].txid, 0xab, TXID_LEN);
+    tx.inputs[0].vout = 0;
+    tx.output_count = 1;
+    tx.outputs[0].value = 1000;
+    strncpy(tx.outputs[0].address, "1AliceAddr...", BTC_ADDRESS_MAXLEN);
+
+    transaction_compute_txid(&tx);
+
+    //Sign not necessary for serialize test, but can fill pubkey/sig 
+    uint8_t buf[4096];
+    size_t n = transaction_serialize(&tx, buf, sizeof(buf));
+    Transaction tx2;
+    transaction_deserialize(&tx2, buf, n);
+    transaction_print(&tx);
+    transaction_print(&tx2);
+    */
     /*
     printf("==== test ====\n\n");
 
@@ -375,7 +788,10 @@ int main(int argc, char* argv[]) {
     
     free(chain);
     */
-     if (argc < 2) {
+     
+
+
+    /*if (argc < 2) {
         printf("Usage: %s <port> [peer_ip:peer_port]\n", argv[0]);
         return 1;
     }
@@ -396,7 +812,16 @@ int main(int argc, char* argv[]) {
         uint16_t peer_port;
         sscanf(argv[2], "%31[^:]:%hu", ip, &peer_port);
         p2p_add_peer(&net, ip, peer_port);
-    }
+    }*/
+
+
+
+
+
+
+
+
+
     /*    // 启动线程监听（假设我们用同一个程序连接回自己模拟）
     for (size_t i = 0; i < net.peer_count; i++) {
         pthread_t tid;
@@ -412,15 +837,15 @@ int main(int argc, char* argv[]) {
     printf("Press Ctrl+C to exit\n");
     while (1) sleep(1);*/
     // 简单测试：每 5 秒广播 PING
-    while (1) {
+    /*while (1) {
         Message ping = { .type = MSG_PING, .payload_len = 0 };
         p2p_broadcast(&net, &ping);
         sleep(5);
     }
-
+    
     
     return 0;
-}
+}*/
 
 
 

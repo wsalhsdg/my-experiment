@@ -5,6 +5,20 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <core/tx_pool.h>
+#include <global/global.h>
+
+
+
+extern int txpool_add(TxPool* pool, const Transaction* tx, const UTXOSet* utxos);
+
+// 检查交易输入是否存在于本地 UTXO
+int utxo_exist(const UTXOSet* utxos, const TxIn* inputs, size_t input_count);
+
+// 同步缺失 UTXO
+int sync_utxos(Peer* peer, const Transaction* tx);
+
+int validate_block(const Block* blk);
 
 void p2p_init(P2PNetwork* net) {
     if (!net) return;
@@ -122,6 +136,64 @@ void p2p_broadcast(P2PNetwork* net, const Message* msg) {
     }
 }
 
+int utxo_exist(const UTXOSet* utxos, const TxIn* inputs, size_t input_count) {
+    for (size_t i = 0; i < input_count; i++) {
+        if (!utxo_set_find((UTXOSet*)utxos, inputs[i].txid, inputs[i].vout)) { 
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// 简单同步逻辑：向发送交易的 peer 请求缺失的区块或交易
+/*int sync_utxos(Peer* peer, const Transaction* tx) {
+    printf("[P2P] Syncing UTXOs for txid=");
+    for (int i = 0; i < 4; i++) printf("%02x", tx->txid[i]);
+    printf(" from peer %s:%d\n", peer->ip, peer->port);
+
+    // 这里我们可以发送一个 MSG_GETUTXO 消息给 peer
+    // 假设 MessageType MSG_GETUTXO = 10
+    Message msg = { 0 };
+    msg.type = MSG_GETUTXO;
+    msg.payload_len = sizeof(Transaction);
+    memcpy(msg.payload, tx, sizeof(Transaction));
+
+    if (p2p_send_message(peer, &msg) < 0) {
+        printf("[P2P] Failed to request UTXO sync\n");
+        return 0;
+    }
+
+    // 等待同步完成（简单占位，实际可以做异步更新）
+    // 在 demo 中先返回 0 表示还未同步完成
+    return 0;
+}*/
+
+int validate_block(const Block* blk) {
+    if (!blk) return 0;
+    // 可以检查：前哈希是否存在、Merkle Root 是否正确、时间戳、大小等
+    // 实验/简化版可以直接返回 1
+    return 1;
+}
+
+int pending_txpool_add(PendingTxPool* pool, const Transaction* tx) {
+    if (!pool || !tx || pool->count >= MAX_PENDING_TX) return -1;
+    pool->txs[pool->count++] = *tx;
+    return 0;
+}
+
+int pending_txpool_remove(PendingTxPool* pool, const Transaction* tx) {
+    if (!pool || !tx) return -1;
+    for (size_t i = 0; i < pool->count; i++) {
+        if (memcmp(pool->txs[i].txid, tx->txid, TXID_LEN) == 0) {
+            pool->txs[i] = pool->txs[pool->count - 1];
+            pool->count--;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+
 // 简单消息处理（可在独立线程中运行）
 void* p2p_handle_incoming(void* arg) {
     Peer* peer = (Peer*)arg;
@@ -161,23 +233,87 @@ void* p2p_handle_incoming(void* arg) {
             p2p_send_message(peer, &pong);
             break;
         }
-        case MSG_PONG:{
+        case MSG_PONG: {
             printf("[P2P] Received PONG from %s:%d\n", peer->ip, peer->port);
             break;
-        case MSG_TX:
-            printf("[P2P] Received TX payload from %s:%d\n", peer->ip, peer->port);
-            break;
-        case MSG_BLOCK:
-            printf("[P2P] Received BLOCK payload from %s:%d\n", peer->ip, peer->port);
-            break;
-        default:
-            printf("[P2P] Unknown message type %d from %s:%d\n", msg.type, peer->ip, peer->port);
+        }
+        case MSG_TX: {
+            if (msg.payload_len != sizeof(Transaction)) break;
+            Transaction tx_recv;
+            memcpy(&tx_recv, msg.payload, sizeof(Transaction));
+
+            // 检查本地 UTXO 是否满足交易输入
+            if (utxo_exist(&g_utxos, tx_recv.inputs, tx_recv.input_count)) {
+                // 输入存在，加入 mempool
+                if (txpool_add(&g_txpool, &tx_recv, &g_utxos)) {
+                    printf("[P2P] TX added to mempool (from %s:%d). txid=", peer->ip, peer->port);
+                    for (int k = 0; k < 4; k++) printf("%02x", tx_recv.txid[k]);
+                    printf("...\n");
+
+                    // 广播给其他节点
+                    p2p_broadcast(&g_net, &msg);
+                }
+                else {
+                    printf("[P2P] TX rejected or already in mempool\n");
+                }
+            }
+            else {
+                // 输入缺失 → 暂存到 pending_tx_pool 等待区块同步
+                printf("[P2P] TX input missing in local UTXO, storing in pending_tx_pool, waiting for block sync...\n");
+                pending_txpool_add(&g_pending_txpool, &tx_recv);
+            }
             break;
         }
         
+        case MSG_BLOCK: {
+            Block blk;
+            memcpy(&blk, msg.payload, sizeof(Block));
+
+            // 1. 验证区块前哈希和时间戳等
+            if (!validate_block(&blk)) break;
+
+            // 2. 遍历区块里的交易更新 UTXO
+            for (size_t i = 0; i < blk.tx_count; i++) {
+                utxo_set_update_from_tx(&g_utxos, &blk.txs[i]);
+
+                // 3. 如果交易在本地 mempool，也要移除
+                txpool_remove(&g_txpool, blk.txs[i].txid);
+            }
+            // 遍历 pending_tx_pool，尝试加入 mempool
+            for (size_t i = 0; i < g_pending_txpool.count; i++) {
+                Transaction* pending_tx = &g_pending_txpool.txs[i];
+                if (utxo_exist(&g_utxos, pending_tx->inputs, pending_tx->input_count)) {
+                    if (txpool_add(&g_txpool, pending_tx, &g_utxos)) {
+                        printf("[P2P] Pending TX now valid, added to mempool. txid=");
+                        for (int k = 0; k < 4; k++) printf("%02x", pending_tx->txid[k]);
+                        printf("...\n");
+
+                        // 广播给其他节点
+                        Message tx_msg = { 0 };
+                        tx_msg.type = MSG_TX;
+                        tx_msg.payload_len = sizeof(Transaction);
+                        memcpy(tx_msg.payload, pending_tx, sizeof(Transaction));
+                        p2p_broadcast(&g_net, &tx_msg);
+
+                        // 从 pending_tx_pool 删除已处理的交易
+                        pending_txpool_remove(&g_pending_txpool, pending_tx);
+                        i--; // 调整索引
+                    }
+                }
+            }
+            // 4. 将区块加入本地区块链
+            blockchain_add_block(&g_chain, &blk);
+
+            printf("[P2P] Block processed, UTXO set and mempool updated\n");
+
+            break;
+        }
+        
+
+
         }
     }
-
     close(peer->sockfd);
     return NULL;
 }
+

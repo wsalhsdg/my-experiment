@@ -76,7 +76,7 @@ void utxo_set_update_from_tx(UTXOSet* utxos, const Transaction* tx) {
         const TxIn* in = &tx->inputs[i];
 
         printf("Removing spent UTXO: ");
-        for (int k = 0; k < 4; k++) printf("%02x", in->txid[k]);
+        for (int k = 0; k < 4; k++) printf("%02x", in->txid[k]);//仅展示前四字节
         printf(" (vout=%u)\n", in->vout);
 
         utxo_set_remove(utxos, in->txid, in->vout);
