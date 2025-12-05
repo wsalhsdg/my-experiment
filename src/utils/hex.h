@@ -1,5 +1,10 @@
-#pragma once
+#ifndef HEX_H
+#define HEX_H
+
 #include <stddef.h>
 #include <stdint.h>
 
-void bytes_to_hex(const uint8_t* in, size_t len, char* out);
+//----hex ×ª»»³É bytes----
+int hex_bin(const char* hex, unsigned char* out, size_t outlen);
+
+#endif

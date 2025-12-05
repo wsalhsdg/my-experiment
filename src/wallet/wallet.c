@@ -1,44 +1,22 @@
-#include "wallet.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdint.h>
+#include <time.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include "../crypto/crypto_tools.h" // hash160, pubkey_to_address
-#include "../crypto/double_sha256.h"
-#include "../crypto/sha256.h"
-#include "../crypto/ripemd160.h"
-#include "../crypto/base58.h"
-#ifdef USE_SECP256K1
+#include <openssl/sha.h>
+#include <openssl/evp.h>
+#include <stdlib.h>
 #include <secp256k1.h>
+#include "wallet/wallet.h"
+#include "crypto/base58check.h"
+//#include "../crypto/crypto_tools.h" // hash160, pubkey_to_address
+//#include "../crypto/double_sha256.h"
+//#include "../crypto/sha256.h"
+//#include "../crypto/ripemd160.h"
+#include "utils/hex.h"
 
-static secp256k1_context* secp_ctx = NULL;
-static int secp_init_once(void) {
-    if (secp_ctx) return 0;
-    secp_ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
-    return secp_ctx ? 0 : -1;
-}
-#endif
-
-// helper: bytes -> hex
-static void bytes_to_hex_static(const uint8_t* in, size_t len, char* out) {
-    static const char* hex = "0123456789abcdef";
-    for (size_t i = 0; i < len; ++i) {
-        out[i * 2] = hex[(in[i] >> 4) & 0xF];
-        out[i * 2 + 1] = hex[in[i] & 0xF];
-    }
-    out[len * 2] = '\0';
-}
-
-// Convert hex char to integer 0-15
-static int hex_val(char c) {
-    if ('0' <= c && c <= '9') return c - '0';
-    if ('a' <= c && c <= 'f') return c - 'a' + 10;
-    if ('A' <= c && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
-
+/*
 int hex_to_bytes(const char* hex, uint8_t* out, size_t out_len) {
     size_t hex_len = strlen(hex);
 
@@ -54,286 +32,228 @@ int hex_to_bytes(const char* hex, uint8_t* out, size_t out_len) {
     }
 
     return hex_len / 2; // number of bytes written
-}
-
-// generate 32 bytes random from /dev/urandom
-static int random32(uint8_t out[32]) {
-    int fd = open("/dev/urandom", O_RDONLY);
-    if (fd < 0) return -1;
-    ssize_t r = read(fd, out, 32);
-    close(fd);
-    return (r == 32) ? 0 : -1;
-}
-
-// derive compressed pubkey from privkey using secp256k1 (if enabled)
-static int derive_pubkey_compressed(const uint8_t priv[32], uint8_t pubout[33]) {
-#ifdef USE_SECP256K1
-    if (secp_init_once() != 0) return -1;
-    secp256k1_pubkey pub;
-    if (!secp256k1_ec_pubkey_create(secp_ctx, &pub, priv)) return -1;
-    unsigned char out[33];
-    size_t outlen = 33;
-    secp256k1_ec_pubkey_serialize(secp_ctx, out, &outlen, &pub, SECP256K1_EC_COMPRESSED);
-    if (outlen != 33) return -1;
-    memcpy(pubout, out, 33);
-    return 0;
-#else
-    // 没有启用 libsecp256k1：则无法产生公钥
-    (void)priv; (void)pubout;
-    return -1;
-#endif
-}
-
-int wallet_create(Wallet* w) {
-    if (!w) return -1;
-    if (random32(w->privkey) != 0) return -1;
-
-    if (derive_pubkey_compressed(w->privkey, w->pubkey) != 0) {
-        // 如果没有可用的 secp256k1，返回错误（提示用户）
-        fprintf(stderr, "ERROR: libsecp256k1 not available — compile with -DUSE_SECP256K1 and link -lsecp256k1\n");
-        return -2;
-    }
-
-    // 用你已有的整合接口生成 address
-    pubkey_to_address(w->pubkey, w->address);
-    return 0;
-}
-
-int wallet_from_privkey(Wallet* w, const uint8_t privkey[32]) {
-    if (!w || !privkey) return -1;
-    memcpy(w->privkey, privkey, 32);
-    if (derive_pubkey_compressed(w->privkey, w->pubkey) != 0) {
-        fprintf(stderr, "ERROR: libsecp256k1 not available — cannot derive pubkey\n");
-        return -2;
-    }
-    pubkey_to_address(w->pubkey, w->address);
-    return 0;
-}
-
-void wallet_privkey_to_hex(const Wallet* w, char out[WALLET_KEY_HEX_LEN + 1]) {
-    if (!w || !out) return;
-    bytes_to_hex_static(w->privkey, 32, out);
-}
-
-int wallet_privkey_from_hex(Wallet* w, const char hex[WALLET_KEY_HEX_LEN]) {
-    if (!w || !hex) return -1;
-    if (hex_to_bytes(hex, w->privkey, 32) != 0) return -1;
-    return wallet_from_privkey(w, w->privkey);
-}
-
-int wallet_save_keystore(const Wallet* w, const char* path) {
-    if (!w || !path) return -1;
-    char keyhex[WALLET_KEY_HEX_LEN + 1];
-    wallet_privkey_to_hex(w, keyhex);
-
-    FILE* f = fopen(path, "w");
-    if (!f) return -1;
-    fprintf(f, "{\n");
-    fprintf(f, "  \"address\": \"%s\",\n", w->address);
-    fprintf(f, "  \"privkey_hex\": \"%s\"\n", keyhex);
-    fprintf(f, "}\n");
-    fclose(f);
-    return 0;
-}
-
-int wallet_load_keystore(Wallet* w, const char* path) {
-    if (!w || !path) return -1;
-    FILE* f = fopen(path, "r");
-    if (!f) return -1;
-    // 解析 JSON
-    char buf[512];
-    char address[64] = { 0 };
-    char keyhex[WALLET_KEY_HEX_LEN + 1] = { 0 };
-    while (fgets(buf, sizeof(buf), f)) {
-
-        // parse address
-        if (strstr(buf, "address")) {
-            sscanf(buf, " %*[^:] : \"%63[^\"]\"", address);
-        }
-
-        // parse privkey_hex
-        else if (strstr(buf, "privkey_hex")) {
-            sscanf(buf, " %*[^:] : \"%64[^\"]\"", keyhex);
-        }
-    }
-
-    fclose(f);
-
-    if (keyhex[0] == '\0') {
-        return -2; // no private key found
-    }
-
-    // load private key
-    if (wallet_privkey_from_hex(w, keyhex) != 0)
-        return -3;
-
-    // load address if present
-    if (address[0]) {
-        strlcpy(w->address, address, sizeof(w->address));
-
-    }
-    else {
-        // rebuild from pubkey
-        pubkey_to_address(w->pubkey, w->address);
-    }
-
-    return 0;
-}
-
-int wallet_sign(const Wallet* w, const uint8_t hash32[32],
-    uint8_t sig_out[72], size_t* sig_len_out)
-{
-#ifdef USE_SECP256K1
-    if (!w || !hash32 || !sig_out || !sig_len_out) return -1;
-    if (secp_init_once() != 0) return -2;
-
-    secp256k1_ecdsa_signature sig;
-
-    if (!secp256k1_ecdsa_sign(secp_ctx, &sig, hash32, w->privkey,
-        secp256k1_nonce_function_rfc6979, NULL)) {
-        return -3;
-    }
-
-    size_t len = 72;
-    if (!secp256k1_ecdsa_signature_serialize_der(secp_ctx, sig_out, &len, &sig)) {
-        return -4;
-    }
-
-    *sig_len_out = len;
-    return 0;
-#else
-    (void)w; (void)hash32; (void)sig_out; (void)sig_len_out;
-    return -99; // libsecp256k1 未开启
-#endif
-}
-
-int wallet_verify(const uint8_t pubkey[33],
-    const uint8_t hash32[32],
-    const uint8_t* sig, size_t sig_len)
-{
-#ifdef USE_SECP256K1
-    if (!pubkey || !hash32 || !sig) return -1;
-    if (secp_init_once() != 0) return -2;
-
-    secp256k1_pubkey pk;
-    if (!secp256k1_ec_pubkey_parse(secp_ctx, &pk, pubkey, 33)) {
-        return -3;
-    }
-
-    secp256k1_ecdsa_signature s;
-    if (!secp256k1_ecdsa_signature_parse_der(secp_ctx, &s, sig, sig_len)) {
-        return -4;
-    }
-
-    return secp256k1_ecdsa_verify(secp_ctx, &s, hash32, &pk) ? 0 : -5;
-#else
-    (void)pubkey; (void)hash32; (void)sig; (void)sig_len;
-    return -99;
-#endif
-}
-
-// ------------------------
-// wallet_get_pubkey_hash
-// ------------------------
-int wallet_get_pubkey_hash(const Wallet* w, uint8_t out20[20]) {
-    if (!w || !out20) return -1;
-    uint8_t hash[32];
-    sha256(w->pubkey, 33, hash);      // SHA256(pubkey)
-    ripemd160(hash, 32, out20);       // RIPEMD160(SHA256(pubkey))
-    return 0;
-}
-
-// ------------------------
-// wallet_build_p2pkh_scriptpubkey
-// ------------------------
-int wallet_build_p2pkh_scriptpubkey(const Wallet* w, uint8_t* script_out, size_t* script_len_out) {
-    if (!w || !script_out || !script_len_out) return -1;
-
-    uint8_t pubkey_hash[20];
-    if (wallet_get_pubkey_hash(w, pubkey_hash) != 0) return -2;
-
-    // OP_DUP OP_HASH160 20 <pubkeyhash> OP_EQUALVERIFY OP_CHECKSIG
-    size_t idx = 0;
-    script_out[idx++] = 0x76;            // OP_DUP
-    script_out[idx++] = 0xa9;            // OP_HASH160
-    script_out[idx++] = 0x14;            // push 20 bytes
-    memcpy(script_out + idx, pubkey_hash, 20);
-    idx += 20;
-    script_out[idx++] = 0x88;            // OP_EQUALVERIFY
-    script_out[idx++] = 0xac;            // OP_CHECKSIG
-
-    *script_len_out = idx;
-    return 0;
-}
-
-// ------------------------
-// wallet_build_p2pkh_scriptsig
-// ------------------------
-int wallet_build_p2pkh_scriptsig(
-    const Wallet* w,
-    const uint8_t sighash32[32],
-    uint8_t* scriptSig_out,
-    size_t* scriptSig_len_out)
-{
-#ifdef USE_SECP256K1
-    if (!w || !sighash32 || !scriptSig_out || !scriptSig_len_out) return -1;
-
-    uint8_t sig[72];
-    size_t sig_len;
-    if (wallet_sign(w, sighash32, sig, &sig_len) != 0) return -2;
-
-    // scriptSig = <sig+SIGHASH_ALL> <pubkey>
-    size_t idx = 0;
-
-    // push signature (append SIGHASH_ALL 0x01)
-    sig[sig_len++] = 0x01; // SIGHASH_ALL
-    scriptSig_out[idx++] = (uint8_t)sig_len;
-    memcpy(scriptSig_out + idx, sig, sig_len);
-    idx += sig_len;
-
-    // push compressed pubkey
-    scriptSig_out[idx++] = 33; // pubkey length
-    memcpy(scriptSig_out + idx, w->pubkey, 33);
-    idx += 33;
-
-    *scriptSig_len_out = idx;
-    return 0;
-#else
-    (void)w; (void)sighash32; (void)scriptSig_out; (void)scriptSig_len_out;
-    return -99;
-#endif
-}
-
-/*
-    简化版本：只处理 SIGHASH_ALL，假设 tx_raw 已经完整序列化
-    input_index 指定签名输入，其他输入的 script 置空
-    script_pubkey 填入要签名输入的 scriptPubKey
-
-int wallet_compute_sighash_p2pkh(
-    const uint8_t* tx_raw, size_t tx_len,
-    size_t input_index,
-    const uint8_t* script_pubkey, size_t script_pubkey_len,
-    uint32_t sighash_type,
-    uint8_t out_hash32[32])
-{
-    if (!tx_raw || !script_pubkey || !out_hash32) return -1;
-    // 这里演示一个简单方案：构造 tx_copy，替换输入的 script
-    // 对实验用最小交易即可。完整实现需解析序列化交易，复杂一些
-    // 为实验，这里直接 double_sha256(tx_raw || sighash_type)
-    size_t buf_len = tx_len + 4;
-    uint8_t* buf = (uint8_t*)malloc(buf_len);
-    if (!buf) return -2;
-    memcpy(buf, tx_raw, tx_len);
-    buf[tx_len + 0] = sighash_type & 0xFF;
-    buf[tx_len + 1] = (sighash_type >> 8) & 0xFF;
-    buf[tx_len + 2] = (sighash_type >> 16) & 0xFF;
-    buf[tx_len + 3] = (sighash_type >> 24) & 0xFF;
-
-    double_sha256(buf, buf_len, out_hash32);
-    free(buf);
-    return 0;
 }*/
 
+//----随机生成私钥----
+void generate_privkey(unsigned char* priv) {
+    srand((unsigned int)time(NULL));
+    for (int i = 0; i < 32; i++) priv[i] = rand() % 256;
+}
+
+//----私钥生成WIF----
+void privkey_to_WIF(unsigned char* priv, int priv_len, int compressed, char* wif_out, int wif_outlen) {
+    // payload 前缀 + 私钥数据
+    unsigned char payload[34];
+    payload[0] = 0xB0; // 自定义 WIF 前缀，类似比特币中 0x80
+    memcpy(payload + 1, priv, priv_len);
+
+    int payload_size = priv_len + 1;
+
+    // 如果使用压缩公钥，则在私钥末尾加 0x01
+    if (compressed) { 
+        payload[payload_size] = 0x01; payload_size += 1; 
+    }
+
+    // 计算双 SHA256 校验码，使用两次sha256
+    unsigned char hash1[32], hash2[32], final[38];
+    SHA256(payload, payload_size, hash1);   // 第一次 SHA256
+    SHA256(hash1, 32, hash2);               // 第二次 SHA256
+
+    // 构建最终字节序列
+    memcpy(final, payload, payload_size);
+    memcpy(final + payload_size, hash2, 4);
+
+    Base58check_encode(final, payload_size + 4, wif_out, wif_outlen);
+}
+
+//----私钥生成公钥 + 地址----
+int privkey_to_pubkey_and_addr(
+    const unsigned char* priv_key,       // 输入私钥
+    unsigned char* pub_key_out,          // 输出公钥
+    size_t* pub_key_out_len,             // 输入/输出：公钥长度
+    char* addr_out,                      // 输出地址字符串
+    int addr_out_len,                    // 地址缓冲区长度
+    int compressed                       // 是否使用压缩公钥
+) {
+    if (!priv_key || !pub_key_out || !pub_key_len || !addr_out) return 0;
+
+    // 创建 secp256k1 上下文
+    secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    if (!ctx) return 0;
+
+    // 验证私钥
+    if (!secp256k1_ec_seckey_verify(ctx, priv_key)) {
+        secp256k1_context_destroy(ctx);
+        return 0;
+    }
+
+    // 根据私钥生成公钥
+    secp256k1_pubkey pub_key;
+    if (!secp256k1_ec_pubkey_create(ctx, &pub_key, priv_key)) {
+        secp256k1_context_destroy(ctx);
+        return 0;
+    }
+
+    // 序列化公钥
+    size_t publen = *pub_key_out_len;
+    if (compressed)
+        secp256k1_ec_pubkey_serialize(ctx, pub_key_out, &publen, &pub_key, SECP256K1_EC_COMPRESSED);
+    else
+        secp256k1_ec_pubkey_serialize(ctx, pub_key_out, &publen, &pub_key, SECP256K1_EC_UNCOMPRESSED);
+    *pub_key_out_len = publen;
+
+    // ----计算HASH160(publickey)----
+    // HASH160 = RIPEMD160(SHA256(pubkey))
+    unsigned char SHA256[32], ripemd_hash[20]; 
+    unsigned int ripemdlen;
+    SHA256(pub_key_out, publen, SHA256);
+    EVP_MD_CTX* ctx2 = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(ctx2, EVP_ripemd160(), NULL);
+    EVP_DigestUpdate(ctx2, SHA256, 32);
+    EVP_DigestFinal_ex(ctx2, ripemd_hash, &ripemdlen);
+    EVP_MD_CTX_free(ctx2);
+
+    // ----生成地址 payload和校验码----
+    unsigned char payload[21];
+    unsigned char checksum1[32], checksum2[32], final[25];
+    payload[0] = 0xA1; 
+
+    memcpy(payload + 1, ripemd_hash, 20);
+    SHA256(payload, 21, checksum1);
+    SHA256(checksum1, 32, checksum2);
+
+    // 最终字节序列 = payload + 校验码前 4 字节
+    memcpy(final, payload, 21);
+    memcpy(final + 21, checksum2, 4);
+
+    Base58check_encode(final, 25, addr_out, addr_out_len);
+    secp256k1_context_destroy(ctx);
+
+    return 1;
+}
+
+// ----计算交易哈希----
+void tx_hash(const Tx* tx, unsigned char hash_out[32]) {
+
+    EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(mdctx, EVP_sha256(), NULL);
+
+    // 对每个输入进行摘要
+    for (uint32_t i = 0; i < tx->input_count; i++) {
+        EVP_DigestUpdate(mdctx, tx->inputs[i].txid, 32);
+
+        EVP_DigestUpdate(mdctx, &tx->inputs[i].output_index, sizeof(uint32_t));
+    }
+
+    // 对每个输出进行摘要
+    for (uint32_t i = 0; i < tx->output_count; i++) {
+        EVP_DigestUpdate(mdctx, tx->outputs[i].addr, strlen(tx->outputs[i].addr));
+        EVP_DigestUpdate(mdctx, &tx->outputs[i].amount, sizeof(uint32_t));
+    }
+
+    unsigned int outlen;
+
+    EVP_DigestFinal_ex(mdctx, hash_out, &outlen);
+
+
+    EVP_MD_CTX_free(mdctx);
+}
+
+
+//----交易输入签名----
+// 对交易 tx 的每个输入使用私钥 priv 进行签名
+// 返回 1 表示成功，0 表示失败
+int sign_tx(Tx* tx, const unsigned char* priv) {
+    if (!tx || !priv) return 0;
+
+    secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
+    if (!ctx) return 0;
+
+    // 验证私钥
+    if (!secp256k1_ec_seckey_verify(ctx, priv)) {
+        secp256k1_context_destroy(ctx);
+        return 0;
+    }
+
+    unsigned char hash[32];
+    tx_hash(tx, hash);
+
+    for (uint32_t i = 0; i < tx->input_count; i++) {
+        secp256k1_ecdsa_signature sig;
+        if (!secp256k1_ecdsa_sign(ctx, &sig, hash, priv, NULL, NULL)) {
+            secp256k1_context_destroy(ctx);
+            return 0;
+        }
+        // 将签名序列化为 compact 格式,然后保存
+        secp256k1_ecdsa_signature_serialize_compact(ctx, tx->inputs[i].signature, &sig);
+        tx->inputs[i].sig_len = 64;
+
+        // 公钥
+        secp256k1_pubkey pub;
+        if (!secp256k1_ec_pubkey_create(ctx, &pub, priv)) {//没能正确创建公钥
+            secp256k1_context_destroy(ctx);
+            return 0; 
+        }
+
+        // 序列化公钥
+        size_t publen = 65;
+        if (!secp256k1_ec_pubkey_serialize(ctx, tx->inputs[i].pubkey, &publen, &pub, SECP256K1_EC_UNCOMPRESSED)) {//没能正确序列化
+            secp256k1_context_destroy(ctx);
+            return 0; 
+        }
+        tx->inputs[i].pubkey_len = publen;
+    }
+
+    //释放内存
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+
+
+
+// ----验证交易签名----
+// 验证交易 tx 的每个输入是否由对应私钥签名
+// 返回 1 表示所有签名有效，0 表示有无效签名
+int verify_tx(const Tx* tx) {
+    if (!tx) return 0;
+
+    secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY);
+    if (!ctx) return 0;
+
+    // 计算交易哈希（交易所有输入和输出的 SHA256 摘要）
+    unsigned char hash[32];
+    tx_hash(tx, hash);
+
+    // 遍历交易的每个输入
+    for (uint32_t j = 0; j < tx->input_count; j++) {
+        secp256k1_pubkey pub;
+        // 解析公钥
+        if (!secp256k1_ec_pubkey_parse(ctx, &pub, tx->inputs[j].pubkey, tx->inputs[j].pubkey_len)) {
+            secp256k1_context_destroy(ctx);
+            return 0;
+        }
+        // 解析签名
+        secp256k1_ecdsa_signature sig;
+        if (!secp256k1_ecdsa_signature_parse_compact(ctx, &sig, tx->inputs[j].signature)) {
+            secp256k1_context_destroy(ctx);
+            return 0;
+        }
+        if (!secp256k1_ecdsa_verify(ctx, &sig, hash, &pub)) {
+            secp256k1_context_destroy(ctx);
+            return 0;
+        }
+    }
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+
+
+
+
+
+/*
 int wallet_privkey_to_wif(const Wallet* w, char* out, size_t out_len)
 {
     if (!w || !out || out_len < 60) return -1;
@@ -414,3 +334,4 @@ void wallet_print(const Wallet* w)
     bytes_to_hex_static(w->pubkey, 33, pubhex);
     printf("PubKey   : %s\n", pubhex);
 }
+*/
