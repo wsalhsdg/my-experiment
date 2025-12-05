@@ -1,319 +1,684 @@
-#include "p2p.h"
+ï»¿#include "p2p.h"
+
+#include <arpa/inet.h>
+#include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <arpa/inet.h>
-#include <pthread.h>
-#include <core/tx_pool.h>
-#include <global/global.h>
+
+#include "wallet/wallet.h"
+#include "core/utxo.h"
+#include "global/global.h"
 
 
+#define MAX_PEERS 16
 
-extern int txpool_add(TxPool* pool, const Transaction* tx, const UTXOSet* utxos);
+// P2Påè®®æ¶ˆæ¯ç±»å‹
+#define MSG_TX     1
+#define MSG_BLOCK  2
+#define MSG_EXIT   3
+#define MSG_ADDR   4 
+//extern char addr[128];
+//extern Mempool mempool;
+//extern UTXO* utxo_set;
+//extern Blockchain* blockchain;
+//extern unsigned char priv[32];
 
-// ¼ì²é½»Ò×ÊäÈëÊÇ·ñ´æÔÚÓÚ±¾µØ UTXO
-int utxo_exist(const UTXOSet* utxos, const TxIn* inputs, size_t input_count);
+typedef struct {
+    uint8_t type;
+    uint32_t length;
+} MsgHeader;
 
-// Í¬²½È±Ê§ UTXO
-int sync_utxos(Peer* peer, const Transaction* tx);
+// ----å…¨å±€çŠ¶æ€----
+char serveraddr[128];
+int peers[MAX_PEERS];
+int peer_count = 0;
 
-int validate_block(const Block* blk);
+// ä¸ºæ¯ä¸ª peer ä¿å­˜ wallet address å’Œ pubkeyï¼ˆä¸ peers[] ç´¢å¼•ä¸€ä¸€å¯¹åº”ï¼‰
+char peer_addrs[MAX_PEERS][128];
+unsigned char peer_pubkeys[MAX_PEERS][65];
 
-void p2p_init(P2PNetwork* net) {
-    if (!net) return;
-    memset(net, 0, sizeof(P2PNetwork));
+volatile int p2p_running = 1;
+int listenfd_global = -1;
+int is_server = 0;
+//char node_addr[128] = { 0 };
+//unsigned char node_pubkey[65] = { 0 };
+//size_t node_pubkey_len = 65;
+Tx* tx = NULL;
+pthread_mutex_t peers_lock = PTHREAD_MUTEX_INITIALIZER;
+
+
+//extern Mempool mempool;
+//extern UTXO* utxo_set;
+//extern Blockchain* blockchain;
+
+
+// åŒæ­¥ç¼ºå¤± UTXO
+//int sync_utxos(Peer* peer, const Transaction* tx);
+
+
+// ----peeræŸ¥è¯¢----
+static int find_peer(int sock) {
+    int idx = -1;
+    pthread_mutex_lock(&peers_lock);
+    for (int i = 0; i < peer_count; i++) {
+        if (peers[i] == sock) { idx = i; break; }
+    }
+    pthread_mutex_unlock(&peers_lock);
+    return idx;
 }
 
-// Server thread: accept incoming connections
-void* p2p_server_thread(void* arg) {
-    P2PNetwork* net = (P2PNetwork*)arg;
-    if (!net) return NULL;
+// ---- Tx åºåˆ—åŒ– ----
+unsigned char* serialize_tx(Tx* tx, size_t* out_len) {
+    // é¢„ä¼°åºåˆ—åŒ–åçš„é•¿åº¦
+    size_t len = 
+        sizeof(uint32_t) 
+        + tx->input_count * (32 + sizeof(uint32_t) + 64 + sizeof(size_t) + 65 + sizeof(size_t))
+        + sizeof(uint32_t) 
+        + tx->output_count * (35 + sizeof(uint32_t)) 
+        + 32;
 
-    int listen_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_sock < 0) {
-        perror("socket");
-        return NULL;
+    unsigned char* buf = malloc(len);
+    if (!buf) return NULL;
+    memset(buf, 0, len);  // æ¸…é›¶ç¼“å†²åŒº
+
+    unsigned char* p = buf;
+
+    // å†™å…¥è¾“å…¥
+    memcpy(p, &tx->input_count, sizeof(uint32_t)); 
+    p += sizeof(uint32_t);
+
+    for (uint32_t i = 0; i < tx->input_count; i++) {
+        TxIn* in = &tx->inputs[i];
+        memcpy(p, in->txid, 32); 
+        p += 32;
+        memcpy(p, &in->output_index, sizeof(uint32_t)); 
+        p += sizeof(uint32_t);
+        memcpy(p, in->signature, 64); 
+        p += 64;
+        memcpy(p, &in->sig_len, sizeof(size_t)); 
+        p += sizeof(size_t);
+        memcpy(p, in->pubkey, 65); 
+        p += 65;
+        memcpy(p, &in->pubkey_len, sizeof(size_t)); 
+        p += sizeof(size_t);
     }
 
-    struct sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(net->listen_port);
-    addr.sin_addr.s_addr = INADDR_ANY;
+    // å†™å…¥è¾“å‡º
+    memcpy(p, &tx->output_count, sizeof(uint32_t)); 
+    p += sizeof(uint32_t);
 
-    if (bind(listen_sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("bind");
-        close(listen_sock);
-        return NULL;
+    for (uint32_t i = 0; i < tx->output_count; i++) {
+        TxOut* out = &tx->outputs[i];
+        memcpy(p, out->addr, 35); 
+        p += 35;
+        memcpy(p, &out->amount, sizeof(uint32_t)); 
+        p += sizeof(uint32_t);
     }
 
-    if (listen(listen_sock, 5) < 0) {
-        perror("listen");
-        close(listen_sock);
-        return NULL;
+    // å†™å…¥ txid
+    memcpy(p, tx->txid, 32); 
+    p += 32;
+
+    *out_len = len;
+    return buf;
+}
+
+// ----ååºåˆ—åŒ– Tx ç»“æ„----
+Tx* deserialize_tx(unsigned char* buf, size_t len) {
+
+    if (!buf || len < sizeof(uint32_t)) return NULL;
+    unsigned char* p = buf;
+    Tx* tx = malloc(sizeof(Tx));
+    if (!tx) return NULL;
+    memset(tx, 0, sizeof(Tx));
+
+    memcpy(&tx->input_count, p, sizeof(uint32_t)); 
+    p += sizeof(uint32_t);
+
+    if (tx->input_count > 0) {
+        tx->inputs = malloc(sizeof(TxIn) * tx->input_count);
+        memset(tx->inputs, 0, sizeof(TxIn) * tx->input_count);
+    }
+    else tx->inputs = NULL;
+
+    for (uint32_t i = 0; i < tx->input_count; i++) {
+        TxIn* in = &tx->inputs[i];
+
+        memcpy(in->txid, p, 32); p += 32;
+        memcpy(&in->output_index, p, sizeof(uint32_t)); p += sizeof(uint32_t);
+        memcpy(in->signature, p, 64); p += 64;
+        memcpy(&in->sig_len, p, sizeof(size_t)); p += sizeof(size_t);
+        memcpy(in->pubkey, p, 65); p += 65;
+        memcpy(&in->pubkey_len, p, sizeof(size_t)); p += sizeof(size_t);
     }
 
-    printf("[P2P] Listening on port %d...\n", net->listen_port);
+    memcpy(&tx->output_count, p, sizeof(uint32_t));
+    p += sizeof(uint32_t);
 
-    while (1) {
-        int client_sock = accept(listen_sock, NULL, NULL);
-        if (client_sock < 0) {
-            perror("accept");
-            continue;
+    if (tx->output_count > 0) {
+        tx->outputs = malloc(sizeof(TxOut) * tx->output_count);
+        memset(tx->outputs, 0, sizeof(TxOut) * tx->output_count);
+    }
+    else tx->outputs = NULL;
+
+    for (uint32_t i = 0; i < tx->output_count; i++) {
+        TxOut* out = &tx->outputs[i];
+        memcpy(out->addr, p, 35); p += 35;
+        memcpy(&out->amount, p, sizeof(uint32_t)); p += sizeof(uint32_t);
+    }
+
+    memcpy(tx->txid, p, 32); p += 32;
+    return tx;
+}
+
+// ---- åŒºå—åºåˆ—åŒ–/ååºåˆ—åŒ– ----
+unsigned char* serialize_block(Block* b, size_t* out_len) 
+{
+    size_t len = sizeof(BlockHeader);
+
+    // é¢„è®¡ç®—åŒºå—æ‰€æœ‰äº¤æ˜“æ‰€éœ€çš„ç©ºé—´
+    for (uint32_t i = 0; i < b->tx_count; i++) {
+        size_t tx_size;
+        unsigned char* tx_buf = serialize_tx(&b->txs[i], &tx_size);
+        len += sizeof(uint32_t) + tx_size;
+        free(tx_buf);
+    }
+
+    unsigned char* buf = malloc(len);
+    if (!buf) return NULL;
+    memset(buf, 0, len);  // æ¸…é›¶ç¼“å†²åŒº
+    unsigned char* p = buf;
+
+    memcpy(p, &b->header, sizeof(BlockHeader)); p += sizeof(BlockHeader);
+    for (uint32_t i = 0; i < b->tx_count; i++) {
+        size_t tx_size;
+        unsigned char* tx_buf = serialize_tx(&b->txs[i], &tx_size);
+        memcpy(p, &tx_size, sizeof(uint32_t)); p += sizeof(uint32_t);
+        memcpy(p, tx_buf, tx_size); p += tx_size;
+        free(tx_buf);
+    }
+
+    *out_len = len;
+    return buf;
+}
+
+// ååºåˆ—åŒ–åŒºå—
+Block* deserialize_block(unsigned char* buf, size_t len) {
+    if (!buf || len < sizeof(BlockHeader)) return NULL;
+    
+    Block* b = malloc(sizeof(Block));
+    unsigned char* p = buf;
+
+    if (!b) return NULL;
+    memset(b, 0, sizeof(Block));
+    // åŒºå—å¤´
+    memcpy(&b->header, p, sizeof(BlockHeader)); 
+    p += sizeof(BlockHeader);
+
+    b->tx_count = 0;
+    b->txs = NULL;
+
+    // ---- è®¡ç®—äº¤æ˜“æ•°é‡ ----
+    unsigned char* q = p;
+    while (q < buf + len) {
+        uint32_t tx_size;
+        memcpy(&tx_size, q, sizeof(uint32_t));
+        q += sizeof(uint32_t) + tx_size;
+        b->tx_count++;
+    }
+
+    //ç”³è¯·ç©ºé—´
+    if (b->tx_count > 0) {
+        b->txs = malloc(sizeof(Tx) * b->tx_count);
+        memset(b->txs, 0, sizeof(Tx) * b->tx_count);
+    }
+    else b->txs = NULL;
+
+    // ---- è§£ææ¯ç¬”äº¤æ˜“ ----
+    for (uint32_t i = 0; i < b->tx_count; i++) {
+        uint32_t tx_size;
+        memcpy(&tx_size, p, sizeof(uint32_t)); p += sizeof(uint32_t);
+        Tx* tx = deserialize_tx(p, tx_size);
+        if (tx) {
+            b->txs[i] = *tx; 
+            free(tx);
+        }
+        p += tx_size;
+    }
+
+    return b;
+}
+
+// ---- å‘é€æ¶ˆæ¯ï¼ˆå¤´ + payloadï¼‰ ----
+void send_message(int sock, uint8_t type, const unsigned char* data, uint32_t len) 
+{
+    MsgHeader hdr = { type, len };
+    send(sock, &hdr, sizeof(hdr), 0);
+    if (len > 0 && data) {
+        send(sock, data, len, 0); 
+    }
+}
+
+// ----å¹¿æ’­èŠ‚ç‚¹èº«ä»½----
+void broadcast_addresss(const char* addr, const unsigned char* pubkey) {
+    if (!addr || !pubkey) return;
+
+    const uint32_t payload_len = 128 + 65;
+    unsigned char* p = malloc(payload_len);
+
+    if (!p) return;
+
+    memset(p, 0, payload_len);
+    strncpy((char*)p, addr, 127); 
+    memcpy(p + 128, pubkey, 65);
+
+    pthread_mutex_lock(&peers_lock);
+    for (int i = 0; i < peer_count; i++) {
+        send_message(peers[i], MSG_ADDR, p, payload_len);
+    }
+    pthread_mutex_unlock(&peers_lock);
+
+    free(p);
+}
+
+
+
+// ----åŒºå—->UTXOæ›´æ–°----
+void block_utxo_update(Block* block)
+{
+    for (uint32_t i = 0; i < block->tx_count; i++) {
+
+        Tx* tx = &block->txs[i];
+
+        // ç§»é™¤å·²è¢«èŠ±è´¹çš„ UTXO
+        for (uint32_t j = 0; j < tx->input_count; j++) {
+
+            UTXO* prev = NULL, * cur = utxo_set;
+
+            while (cur) {
+                if (memcmp(cur->txid, tx->inputs[j].txid, 32) == 0 &&
+                    cur->output_index == tx->inputs[j].output_index)
+                {
+                    if (prev) prev->next = cur->next;
+                    else utxo_set = cur->next;
+
+                    free(cur);
+                    break;
+                }
+                prev = cur;
+                cur = cur->next;
+            }
         }
 
-        if (net->peer_count >= MAX_PEERS) {
-            printf("[P2P] Max peers reached, rejecting connection\n");
-            close(client_sock);
-            continue;
+        // æ·»åŠ å½“å‰ tx çš„è¾“å‡ºä¸ºæ–°çš„ UTXO
+        for (uint32_t m = 0; m < tx->output_count; m++) {
+            add_utxo(&utxo_set, tx->txid, m,
+                tx->outputs[m].addr,
+                tx->outputs[m].amount);
+        }
+    }
+}
+
+// ----peerçº¿ç¨‹----
+void* peer_thread(void* arg) 
+{
+    int sock = *(int*)arg;
+    free(arg);
+
+    int temp = 0;
+
+    // åˆšè¿æ¥å°±ç»™å¯¹æ–¹å‘é€æˆ‘ä»¬çš„åœ°å€ä¿¡æ¯
+    broadcast_addresss(node_addr, node_pubkey);
+
+    while (p2p_running) {
+
+        MsgHeader hdr;
+        int r = recv(sock, &hdr, sizeof(hdr), 0);
+        if (r <= 0) break;
+
+        unsigned char* payload = NULL;
+
+        if (hdr.length > 0) {
+            payload = malloc(hdr.length);
+            if (!payload) break;
+            r = recv(sock, payload, hdr.length, 0);
+            if (r <= 0) {
+                free(payload);
+                break;
+            }
+        }
+        //å¤„ç†æ¶ˆæ¯
+        //å¯¹æ–¹é€€å‡º 
+        if (hdr.type == MSG_EXIT) {
+            if (is_server) {
+                pthread_mutex_lock(&peers_lock);
+
+                for (int i = 0; i < peer_count; i++) {
+                    if (peers[i] == sock) {
+
+                        // åˆ é™¤ peerï¼šæŠŠæœ€åä¸€ä¸ªæŒªè¿‡æ¥è¦†ç›–
+                        peers[i] = peers[peer_count - 1];
+
+                        memcpy(peer_addrs[i], peer_addrs[peer_count - 1], 128);
+                        memcpy(peer_pubkeys[i], peer_pubkeys[peer_count - 1], 65);
+
+                        peer_count--;
+                        break;
+                    }
+                }
+                pthread_mutex_unlock(&peers_lock);
+                printf("[P2P] Client %d disconnected.\n", sock);
+            }
+            else {
+                printf("[P2P] Server exited.\n");
+                free(payload);
+                exit(0);
+            }
+            free(payload);
+            break;
+        }
+        // å¯¹æ–¹å‘é€åœ°å€å’Œå…¬é’¥
+        else if (hdr.type == MSG_ADDR) 
+        {
+
+            if (hdr.length >= 128 + 65 && payload) 
+            {
+                int idx = find_peer(sock);
+
+                if (idx >= 0) 
+                {
+                    memcpy(peer_addrs[idx], payload, 128);
+                    peer_addrs[idx][127] = '\0';
+                    memcpy(peer_pubkeys[idx], payload + 128, 65);
+                    
+                    if (is_server) {
+                        if (temp == 0) {
+                            temp = 1;
+                            printf("[P2P] Peer %d address: %s\n", sock, peer_addrs[idx]);
+
+                        }
+                    }
+
+                    // å®¢æˆ·ç«¯æ‹¿åˆ°åœ°å€åå¯ä»¥å¼€å§‹æ„å»ºåŒºå—
+                    else 
+                    {
+                        if (temp == 0) 
+                        {
+                            temp = 1;
+                            printf("[P2P] Server address: %s\n", peer_addrs[idx]);
+                            MempoolTx* cur = mempool.head;
+                            while (cur) {
+
+                                // è·å–é“¾å°¾
+                                Blockchain* cur_chain = blockchain;
+                                while (cur_chain->next) 
+                                    cur_chain = cur_chain->next;
+                                Block* prev_block = cur_chain->block;
+
+                                // åˆ›å»ºæ–°åŒºå—ï¼ˆæ¯ä¸ªåŒºå—ä¸€ä¸ªäº¤æ˜“ï¼Œå¯æ”¹ä¸ºå¤šä¸ªäº¤æ˜“ï¼‰
+                                Block* b = create_block(prev_block->header.block_hash, cur->tx, 1);
+
+                                blockchain = blockchain_add(blockchain, b);
+                                cur = cur->next;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
-        Peer* peer = &net->peers[net->peer_count++];
-        peer->sockfd = client_sock;
-        peer->port = 0;
-        strncpy(peer->ip, "incoming", sizeof(peer->ip) - 1);
+        // å¯¹æ–¹å‘é€åŒºå—
+        else if (hdr.type == MSG_BLOCK) {
 
-        pthread_t tid;
-        pthread_create(&tid, NULL, p2p_handle_incoming, peer);
-        pthread_detach(tid);
+            Block* blk = deserialize_block(payload, hdr.length);
+            if (blk) {
 
-        printf("[P2P] Accepted incoming connection, total peers=%zu\n", net->peer_count);
+                // æ ¡éªŒåŒºå—åˆæ³•æ€§
+                Blockchain* last_chain = blockchain;
+                while (last_chain && last_chain->next) 
+                    last_chain = last_chain->next;
+
+                Block* prev_block = last_chain ? last_chain->block : NULL;
+
+                if (verify_block(blk, prev_block)) {
+                    blockchain = blockchain_add(blockchain, blk);
+                    block_utxo_update(blk);
+                    printf("[P2P] Block added from peer %d.\n", sock);
+                }
+                else {
+                    printf("[P2P] Invalid block received.\n");
+                    free(blk);//é‡Šæ”¾åŒºå—
+                }
+            }
+        }
+        if (payload) free(payload);//é‡Šæ”¾
     }
-
-    close(listen_sock);
+    close(sock);
     return NULL;
 }
-//client connect to peer
-int p2p_add_peer(P2PNetwork* net, const char* ip, uint16_t port) {
-    if (!net || net->peer_count >= MAX_PEERS) return -1;
 
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        perror("socket");
-        return -1;
-    }
+
+// ----æœåŠ¡å™¨çº¿ç¨‹ï¼šæ¥å—è¿æ¥----
+void* p2p_server_thread(void* arg) {
+    int port = *(int*)arg;
+    free(arg);
+
+    int listenfd = socket(AF_INET, SOCK_STREAM, 0);
+    listenfd_global = listenfd;
 
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
-    inet_pton(AF_INET, ip, &addr.sin_addr);
+    addr.sin_addr.s_addr = INADDR_ANY;
+    bind(listenfd, (struct sockaddr*)&addr, sizeof(addr));
+    listen(listenfd, 10);
 
-    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("connect");
+    printf("[P2P] Listening on port %d...\n", port);
+
+    while (p2p_running) {
+        int client = accept(listenfd, NULL, NULL);
+        if (client < 0) continue;
+
+        pthread_mutex_lock(&peers_lock);
+        if (peer_count < MAX_PEERS) {
+            peers[peer_count] = client;
+            memset(peer_addrs[peer_count], 0, sizeof(peer_addrs[peer_count]));
+            memset(peer_pubkeys[peer_count], 0, sizeof(peer_pubkeys[peer_count]));
+
+            int* s = malloc(sizeof(int)); 
+            *s = client;
+
+            pthread_t tid; 
+            pthread_create(&tid, NULL, peer_thread, s);
+            pthread_detach(tid);
+
+            peer_count++;
+        }
+        else {
+            close(client);
+        }
+        pthread_mutex_unlock(&peers_lock);
+    }
+
+    if (listenfd_global != -1) close(listenfd_global);//å…³é—­
+    listenfd_global = -1;
+
+    return NULL;
+}
+
+//----å¯åŠ¨æœåŠ¡ç«¯----
+void start_server(int port) 
+{
+    is_server = 1;
+
+    int* x = malloc(sizeof(int));
+    *x = port;
+
+    pthread_t tid; 
+    pthread_create(&tid, NULL, p2p_server_thread, x);
+    pthread_detach(tid);
+}
+
+// ----å®¢æˆ·ç«¯åŠŸèƒ½ï¼šè¿æ¥åˆ°è¿œç¨‹èŠ‚ç‚¹----
+int connect_to_peer(const char* ip, int port) 
+{
+    //åˆ›å»ºTCP socket
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+
+    // å­—ç¬¦ä¸² IP â†’ äºŒè¿›åˆ¶
+    if (inet_pton(AF_INET, ip, &addr.sin_addr) <= 0) {
+        printf("[P2P] ERROR: Invalid IP address: %s\n", ip);
         close(sock);
         return -1;
     }
 
-    Peer* peer = &net->peers[net->peer_count++];
-    peer->sockfd = sock;
-    peer->port = port;
-    strncpy(peer->ip, ip, sizeof(peer->ip) - 1);
-
-    pthread_t tid;
-    pthread_create(&tid, NULL, p2p_handle_incoming, peer);
-    pthread_detach(tid);
-
-
-    printf("[P2P] Connected to peer %s:%d\n", ip, port);
-    return 0;
-}
-
-int p2p_send_message(Peer* peer, const Message* msg) {
-    if (!peer || !msg) return -1;
-    // ÏÈ·¢ËÍÏûÏ¢³¤¶È
-    uint32_t len = htonl(sizeof(MessageType) + sizeof(size_t) + msg->payload_len);
-    if (write(peer->sockfd, &len, sizeof(len)) != sizeof(len)) return -1;
-    // ·¢ËÍÍêÕûÏûÏ¢
-    ssize_t n = write(peer->sockfd, msg, sizeof(MessageType) + sizeof(size_t) + msg->payload_len);
-    if (n != (ssize_t)(sizeof(MessageType) + sizeof(size_t) + msg->payload_len))
+    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        printf("[P2P] Connect failed: %s:%d\n", ip, port);
         return -1;
-    return 0;
-}
-
-void p2p_broadcast(P2PNetwork* net, const Message* msg) {
-    for (size_t i = 0; i < net->peer_count; i++) {
-        p2p_send_message(&net->peers[i], msg);
     }
-}
+    //æ–°èŠ‚ç‚¹åŠ å…¥peers
+    pthread_mutex_lock(&peers_lock);
 
-int utxo_exist(const UTXOSet* utxos, const TxIn* inputs, size_t input_count) {
-    for (size_t i = 0; i < input_count; i++) {
-        if (!utxo_set_find((UTXOSet*)utxos, inputs[i].txid, inputs[i].vout)) { 
-            return 0;
-        }
+    if (peer_count < MAX_PEERS) {
+
+        peers[peer_count] = sock;
+        //æ¸…ç©ºè®°å½•
+        memset(peer_addrs[peer_count], 0, sizeof(peer_addrs[peer_count]));
+        memset(peer_pubkeys[peer_count], 0, sizeof(peer_pubkeys[peer_count]));
+
+        int* arg_sock = malloc(sizeof(int)); 
+        *arg_sock = sock;
+
+        pthread_t tid; 
+        pthread_create(&tid, NULL, peer_thread, arg_sock);
+        pthread_detach(tid);
+
+        peer_count++;
     }
-    return 1;
-}
-
-// ¼òµ¥Í¬²½Âß¼­£ºÏò·¢ËÍ½»Ò×µÄ peer ÇëÇóÈ±Ê§µÄÇø¿é»ò½»Ò×
-/*int sync_utxos(Peer* peer, const Transaction* tx) {
-    printf("[P2P] Syncing UTXOs for txid=");
-    for (int i = 0; i < 4; i++) printf("%02x", tx->txid[i]);
-    printf(" from peer %s:%d\n", peer->ip, peer->port);
-
-    // ÕâÀïÎÒÃÇ¿ÉÒÔ·¢ËÍÒ»¸ö MSG_GETUTXO ÏûÏ¢¸ø peer
-    // ¼ÙÉè MessageType MSG_GETUTXO = 10
-    Message msg = { 0 };
-    msg.type = MSG_GETUTXO;
-    msg.payload_len = sizeof(Transaction);
-    memcpy(msg.payload, tx, sizeof(Transaction));
-
-    if (p2p_send_message(peer, &msg) < 0) {
-        printf("[P2P] Failed to request UTXO sync\n");
-        return 0;
+    else {
+        // å·²è¾¾åˆ°æœ€å¤§ä¸Šé™ï¼Œæ‹’ç»
+        printf("[P2P] WARNING: peer limit reached. Closing connection.\n");
+        close(sock);
+        sock = -1;
     }
 
-    // µÈ´ıÍ¬²½Íê³É£¨¼òµ¥Õ¼Î»£¬Êµ¼Ê¿ÉÒÔ×öÒì²½¸üĞÂ£©
-    // ÔÚ demo ÖĞÏÈ·µ»Ø 0 ±íÊ¾»¹Î´Í¬²½Íê³É
-    return 0;
-}*/
+    pthread_mutex_unlock(&peers_lock);
 
-int validate_block(const Block* blk) {
-    if (!blk) return 0;
-    // ¿ÉÒÔ¼ì²é£ºÇ°¹şÏ£ÊÇ·ñ´æÔÚ¡¢Merkle Root ÊÇ·ñÕıÈ·¡¢Ê±¼ä´Á¡¢´óĞ¡µÈ
-    // ÊµÑé/¼ò»¯°æ¿ÉÒÔÖ±½Ó·µ»Ø 1
-    return 1;
+    if (sock != -1)
+        printf("[P2P] Connected to %s:%d\n", ip, port);
+   
+    return sock;
 }
 
-int pending_txpool_add(PendingTxPool* pool, const Transaction* tx) {
-    if (!pool || !tx || pool->count >= MAX_PENDING_TX) return -1;
-    pool->txs[pool->count++] = *tx;
-    return 0;
-}
+// ----é€€å‡º P2Pï¼šå…³é—­æ‰€æœ‰è¿æ¥----
+void p2pstop() 
+{
+    p2p_running = 0;
+    pthread_mutex_lock(&peers_lock);
 
-int pending_txpool_remove(PendingTxPool* pool, const Transaction* tx) {
-    if (!pool || !tx) return -1;
-    for (size_t i = 0; i < pool->count; i++) {
-        if (memcmp(pool->txs[i].txid, tx->txid, TXID_LEN) == 0) {
-            pool->txs[i] = pool->txs[pool->count - 1];
-            pool->count--;
-            return 0;
-        }
+    for (int i = 0; i < peer_count; i++) {
+        send_message(peers[i], MSG_EXIT, NULL, 0);
     }
-    return -1;
-}
 
-
-// ¼òµ¥ÏûÏ¢´¦Àí£¨¿ÉÔÚ¶ÀÁ¢Ïß³ÌÖĞÔËĞĞ£©
-void* p2p_handle_incoming(void* arg) {
-    Peer* peer = (Peer*)arg;
-    if (!peer) return NULL;
-
-    printf("[Thread %lu] Start handling incoming messages from %s:%d\n",
-        pthread_self(), peer->ip, peer->port);
-
-    while (1) {
-        uint32_t len_net;
-        ssize_t n = read(peer->sockfd, &len_net, sizeof(len_net));
-        if (n <= 0) {
-            printf("[P2P] Peer disconnected %s:%d\n", peer->ip, peer->port);
-            break;
-        }
-        uint32_t len = ntohl(len_net);
-        if (len > MSG_BUF_SIZE + sizeof(MessageType) + sizeof(size_t)) {
-            printf("[P2P] Message too large from %s:%d\n", peer->ip, peer->port);
-            break;
-        }
-
-        Message msg;
-        n = read(peer->sockfd, &msg, len);
-        if (n <= 0) {
-            printf("[P2P] Failed to read full message from %s:%d\n", peer->ip, peer->port);
-            break;
-        }
-
-        printf("[Thread %lu] Received message type %d, payload_len=%zu from %s:%d\n",
-            pthread_self(), msg.type, msg.payload_len, peer->ip, peer->port);
-
-        // ¸ù¾İÏûÏ¢ÀàĞÍ´¦Àí
-        switch (msg.type) {
-        case MSG_PING: {
-            printf("[P2P] Responding PONG to %s:%d\n", peer->ip, peer->port);
-            Message pong = { .type = MSG_PONG, .payload_len = 0 };
-            p2p_send_message(peer, &pong);
-            break;
-        }
-        case MSG_PONG: {
-            printf("[P2P] Received PONG from %s:%d\n", peer->ip, peer->port);
-            break;
-        }
-        case MSG_TX: {
-            if (msg.payload_len != sizeof(Transaction)) break;
-            Transaction tx_recv;
-            memcpy(&tx_recv, msg.payload, sizeof(Transaction));
-
-            // ¼ì²é±¾µØ UTXO ÊÇ·ñÂú×ã½»Ò×ÊäÈë
-            if (utxo_exist(&g_utxos, tx_recv.inputs, tx_recv.input_count)) {
-                // ÊäÈë´æÔÚ£¬¼ÓÈë mempool
-                if (txpool_add(&g_txpool, &tx_recv, &g_utxos)) {
-                    printf("[P2P] TX added to mempool (from %s:%d). txid=", peer->ip, peer->port);
-                    for (int k = 0; k < 4; k++) printf("%02x", tx_recv.txid[k]);
-                    printf("...\n");
-
-                    // ¹ã²¥¸øÆäËû½Úµã
-                    p2p_broadcast(&g_net, &msg);
-                }
-                else {
-                    printf("[P2P] TX rejected or already in mempool\n");
-                }
-            }
-            else {
-                // ÊäÈëÈ±Ê§ ¡ú Ôİ´æµ½ pending_tx_pool µÈ´ıÇø¿éÍ¬²½
-                printf("[P2P] TX input missing in local UTXO, storing in pending_tx_pool, waiting for block sync...\n");
-                pending_txpool_add(&g_pending_txpool, &tx_recv);
-            }
-            break;
-        }
-        
-        case MSG_BLOCK: {
-            Block blk;
-            memcpy(&blk, msg.payload, sizeof(Block));
-
-            // 1. ÑéÖ¤Çø¿éÇ°¹şÏ£ºÍÊ±¼ä´ÁµÈ
-            if (!validate_block(&blk)) break;
-
-            // 2. ±éÀúÇø¿éÀïµÄ½»Ò×¸üĞÂ UTXO
-            for (size_t i = 0; i < blk.tx_count; i++) {
-                utxo_set_update_from_tx(&g_utxos, &blk.txs[i]);
-
-                // 3. Èç¹û½»Ò×ÔÚ±¾µØ mempool£¬Ò²ÒªÒÆ³ı
-                txpool_remove(&g_txpool, blk.txs[i].txid);
-            }
-            // ±éÀú pending_tx_pool£¬³¢ÊÔ¼ÓÈë mempool
-            for (size_t i = 0; i < g_pending_txpool.count; i++) {
-                Transaction* pending_tx = &g_pending_txpool.txs[i];
-                if (utxo_exist(&g_utxos, pending_tx->inputs, pending_tx->input_count)) {
-                    if (txpool_add(&g_txpool, pending_tx, &g_utxos)) {
-                        printf("[P2P] Pending TX now valid, added to mempool. txid=");
-                        for (int k = 0; k < 4; k++) printf("%02x", pending_tx->txid[k]);
-                        printf("...\n");
-
-                        // ¹ã²¥¸øÆäËû½Úµã
-                        Message tx_msg = { 0 };
-                        tx_msg.type = MSG_TX;
-                        tx_msg.payload_len = sizeof(Transaction);
-                        memcpy(tx_msg.payload, pending_tx, sizeof(Transaction));
-                        p2p_broadcast(&g_net, &tx_msg);
-
-                        // ´Ó pending_tx_pool É¾³ıÒÑ´¦ÀíµÄ½»Ò×
-                        pending_txpool_remove(&g_pending_txpool, pending_tx);
-                        i--; // µ÷ÕûË÷Òı
-                    }
-                }
-            }
-            // 4. ½«Çø¿é¼ÓÈë±¾µØÇø¿éÁ´
-            blockchain_add_block(&g_chain, &blk);
-
-            printf("[P2P] Block processed, UTXO set and mempool updated\n");
-
-            break;
-        }
-        
-
-
-        }
+    for (int i = 0; i < peer_count; i++) {
+        close(peers[i]);
     }
-    close(peer->sockfd);
-    return NULL;
+
+    peer_count = 0;
+
+    pthread_mutex_unlock(&peers_lock);
+
+    if (listenfd_global != -1) {
+        close(listenfd_global);
+        listenfd_global = -1;
+    }
+    printf("[P2P] shutdown complete.\n");
 }
 
+// ---- å¹¿æ’­äº¤æ˜“ ----
+void broadcast_tx(Tx* tx) {
+    (void)tx;
+}
+
+// ----å¹¿æ’­åŒºå—----
+void broadcast_block(Block* b) {
+    size_t len;
+    unsigned char* buf = serialize_block(b, &len);
+    if (!buf) return;
+
+    pthread_mutex_lock(&peers_lock);
+    for (int i = 0; i < peer_count; i++)
+        send_message(peers[i], MSG_BLOCK, buf, len);
+    pthread_mutex_unlock(&peers_lock);
+
+    free(buf);//é‡Šæ”¾
+}
+
+// ----è®¾ç½®èŠ‚ç‚¹èº«ä»½----
+void set_node_address(const char* addr, const unsigned char* pubkey) {
+    strncpy(node_addr, addr, 127);
+    node_addr[127] = '\0';
+
+    memcpy(node_pubkey, pubkey, 65);
+    printf("[P2P] Node identity setï¼šAddress=%s\n", node_addr);
+}
+
+//åˆ›é€ äº¤æ˜“
+Tx* create_transaction(
+    UTXO** utxo_set,
+    Mempool* mempool,
+    const char* from_addr,
+    const char* to_addr,
+    uint64_t amount,
+    const unsigned char* privkey)
+{
+
+    CoinSelection a;
+    a.count = 0;
+    a.total = 0;
+
+    if (!select_coins(*utxo_set, from_addr, amount, &a)) {
+        printf("Create TX failed! Insufficient funds!\n");
+        return NULL;
+    }
+    printf("Select successï¼š%d UTXOï¼Œtotal: %llu\n",
+        a.count, (unsigned long long)a.total);
+    //åˆ†é…ç»“æ„ä½“
+    Tx* tx = malloc(sizeof(Tx));
+    if (!tx) {
+        printf("Memory allocation failed for Tx\n");
+        return NULL;
+    }
+    //åˆå§‹åŒ–
+    init_tx(tx);
+
+    for (int i = 0; i < a.count; i++) {
+        add_txin(tx, a.utxos[i]->txid, a.utxos[i]->output_index);
+    }
+    add_txout(tx, to_addr, amount);
+    //è¿›è¡Œæ‰¾é›¶
+    uint64_t changes = a.total - amount;
+    if (changes > 0) {
+        add_txout(tx, from_addr, changes);
+    }
+    sign_tx(tx, privkey);
+    //ç”Ÿæˆäº¤æ˜“ID
+    tx_hash(tx, tx->txid);
+    //æ·»åŠ äº¤æ˜“æ± 
+    mempool_add_tx(mempool, tx, *utxo_set);
+    //æ›´æ–°utxoé›†
+    update_utxo_set(utxo_set, tx, tx->txid);
+
+    printf("Transaction created successfully!\n");
+    printf("  Output: %llu\n", (unsigned long long)amount);
+    printf("  Change: %llu\n", (unsigned long long)changes);
+
+    return tx;
+}

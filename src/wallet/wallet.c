@@ -75,7 +75,7 @@ int privkey_to_pubkey_and_addr(
     int addr_out_len,                    // 地址缓冲区长度
     int compressed                       // 是否使用压缩公钥
 ) {
-    if (!priv_key || !pub_key_out || !pub_key_len || !addr_out) return 0;
+    if (!priv_key || !pub_key_out || !pub_key_out_len || !addr_out) return 0;
 
     // 创建 secp256k1 上下文
     secp256k1_context* ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
@@ -104,12 +104,12 @@ int privkey_to_pubkey_and_addr(
 
     // ----计算HASH160(publickey)----
     // HASH160 = RIPEMD160(SHA256(pubkey))
-    unsigned char SHA256[32], ripemd_hash[20]; 
+    unsigned char sha[32], ripemd_hash[20]; 
     unsigned int ripemdlen;
-    SHA256(pub_key_out, publen, SHA256);
+    SHA256(pub_key_out, publen, sha);
     EVP_MD_CTX* ctx2 = EVP_MD_CTX_new();
     EVP_DigestInit_ex(ctx2, EVP_ripemd160(), NULL);
-    EVP_DigestUpdate(ctx2, SHA256, 32);
+    EVP_DigestUpdate(ctx2, sha, 32);
     EVP_DigestFinal_ex(ctx2, ripemd_hash, &ripemdlen);
     EVP_MD_CTX_free(ctx2);
 

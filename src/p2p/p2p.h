@@ -1,51 +1,52 @@
-#pragma once
+﻿#ifndef P2P_H
+#define P2P_H
+
+#include <stdint.h>
 #include <stdint.h>
 #include <stddef.h>
-#include "core/block.h"
 #include "core/transaction.h"
+#include "core/block.h"
+#include "core/utxo.h"
+#include "core/mempool.h"
+#include "core/blockchain.h"
+#include "global/global.h"
 
-#define MAX_PEERS 16
-#define MSG_BUF_SIZE 4096
+//extern Mempool mempool;
+//extern UTXO* utxo_set;
+//extern Blockchain* blockchain;
 
-// ��Ϣ����
-typedef enum {
-    MSG_PING = 1,
-    MSG_PONG = 2,
-    MSG_TX = 3,
-    MSG_BLOCK = 4,
-    MSG_INV = 5,
-    
-} MessageType;
+// ----创建交易----
+Tx* create_transaction(
+    UTXO** utxo_set,                //全局 UTXO 集
+    Mempool* mempool,               //交易池
+    const char* from_addr,          //发送地址
+    const char* to_addr,            //接收地址
+    uint64_t amount,                //价格
+    const unsigned char* privkey);  //签名私钥
+#endif
 
-// P2P ��Ϣ
-typedef struct {
-    MessageType type;
-    size_t payload_len;
-    uint8_t payload[MSG_BUF_SIZE];
-} Message;
+// ----启动 P2P 服务器监听----
+void start_server(int port);
 
-// �ڵ���Ϣ
-typedef struct {
-    char ip[64];
-    uint16_t port;
-    int sockfd;
-} Peer;
+// ----发起连接到其他节点----
+int connect_to_peer(const char* ip, int port);
 
-// P2P ϵͳ״̬
-typedef struct {
-    Peer peers[MAX_PEERS];
-    size_t peer_count;
-    uint16_t listen_port;
-} P2PNetwork;
+// ----关闭所有网络连接----
+void p2pstop(void);
 
-// -----------------------------
-// �ӿں���
-// -----------------------------
-void p2p_init(P2PNetwork* net);
-int p2p_add_peer(P2PNetwork* net, const char* ip, uint16_t port);
-int p2p_send_message(Peer* peer, const Message* msg);
-void p2p_broadcast(P2PNetwork* net, const Message* msg);
-void* p2p_server_thread(void* arg);
-// �߳���ں���
-void* p2p_handle_incoming(void* arg);
+// ----广播区块 ----
+void broadcast_block(Block* b);
+
+// ----广播交易----
+void broadcast_tx(Tx* tx);
+
+// ----把交易产生的UTXO保存的本地----
+void block_utxo_update(Block* block);
+
+// ----广播钱包地址----
+void broadcast_addresss(const char* addr, const unsigned char* pubkey);
+
+// ----设置钱包的地址----
+void set_node_address(const char* addr, const unsigned char* pubkey);
+
 
