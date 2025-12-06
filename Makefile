@@ -6,7 +6,7 @@ CFLAGS = -Wall -Wextra -O2 -DUSE_SECP256K1 -I./src -I./secp256k1/include -g
 LIBS = ./secp256k1/lib/libsecp256k1.a -lssl -lcrypto -lpthread
 
 # 源文件
-SRC = $(wildcard src/*.c src/*/*.c)
+SRC = $(wildcard src/*.c src/*/*.c src/*/*/*.c)
 OBJ = $(SRC:.c=.o)
 
 # 输出文件
