@@ -9,7 +9,7 @@
 #include <unistd.h>
 
 #include "wallet/wallet.h"
-#include "core/utxo.h"
+#include "core/utxo_set.h"
 #include "global/global.h"
 
 
@@ -657,7 +657,7 @@ Tx* create_transaction(
         return NULL;
     }
     //初始化
-    init_tx(tx);
+    transaction_init(tx);
 
     for (int i = 0; i < a.count; i++) {
         add_txin(tx, a.utxos[i]->txid, a.utxos[i]->output_index);
@@ -672,7 +672,7 @@ Tx* create_transaction(
     //生成交易ID
     tx_hash(tx, tx->txid);
     //添加交易池
-    mempool_add_tx(mempool, tx, *utxo_set);
+    tx_pool_add_tx(mempool, tx, *utxo_set);
     //更新utxo集
     update_utxo_set(utxo_set, tx, tx->txid);
 

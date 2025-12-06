@@ -2,7 +2,7 @@
 #define WALLET_H
 #include <stddef.h>
 #include <stdint.h>
-#include "core/block.h"
+#include "core/block/block.h"
 #include "core/transaction.h"
 
 //----Ç©Ãû½»Ò×----//

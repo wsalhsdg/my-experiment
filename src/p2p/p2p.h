@@ -5,10 +5,10 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "core/transaction.h"
-#include "core/block.h"
-#include "core/utxo.h"
-#include "core/mempool.h"
-#include "core/blockchain.h"
+#include "core/block/block.h"
+#include "core/utxo_set.h"
+#include "core/tx_pool.h"
+#include "core/block/blockchain.h"
 #include "global/global.h"
 
 //extern Mempool mempool;
