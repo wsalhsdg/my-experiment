@@ -12,7 +12,7 @@
 /* ´òÓ¡½»Ò×³Ø */
 void tx_pool_print(const Mempool* pool) {
 
-    printf("===== Mempool Transactions =====\n");
+    printf("===== Tx_pool Transactions =====\n");
 
     const MempoolTx* cur = pool->head;
     if (!cur) {

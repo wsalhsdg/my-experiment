@@ -1,1020 +1,507 @@
-#include <stdio.h>
-#include <stdint.h>
-#include <string.h>
+Ôªø#include <stdio.h>
 #include <stdlib.h>
-#include <time.h>
-#include <unistd.h>     // read(), close()
-#include <fcntl.h>      // open(), O_RDONLY
-#include <sys/types.h>
-#include <sys/stat.h>
-#include "wallet/wallet.h"
-#include "core/block.h"
-#include "core/transaction.h"
-#include "core/utxo_set.h"
-#include "core/tx_pool.h"
-#include "crypto/crypto_tools.h"
-#include "p2p/p2p.h"
+#include <string.h>
+#include <inttypes.h>
 #include <pthread.h>
-#include <secp256k1.h>
+#include <unistd.h>          // read(), close()
+#include <fcntl.h>           // open(), O_RDONLY
+
 #include <global/global.h>
+#include <core/block/block.h>
+#include <core/block/blockchain.h>
+#include <wallet/wallet.h>
+#include <core/utxo_set.h>
+#include <core/tx_pool.h>
+#include <p2p/p2p.h>
+#include <core/transaction.h>
 
-// ÀÊª˙…˙≥…ÀΩ‘ø£®32◊÷Ω⁄£©
-void random_privkey(uint8_t priv[32]) {
-    secp256k1_context* ctx = crypto_secp_get_context();
-    int fd = open("/dev/urandom", O_RDONLY);
-    if (fd < 0) {
-        // fallback to rand (∑«¿ÌœÎ)
-        do {
-            for (int i = 0; i < 32; i++) priv[i] = rand() & 0xFF;
-        } while (!secp256k1_ec_seckey_verify(ctx, priv));
-        return;
+#define MINING_REWARD 100
+
+//=====================================================
+//                  ÂÖ®Â±ÄËøêË°åÁä∂ÊÄÅ
+//=====================================================
+
+//Ê†áËÆ∞ÂΩìÂâçËäÇÁÇπÊòØÂê¶‰Ωú‰∏∫ÁüøÂ∑•ËøêË°å
+int running_as_miner = 0;
+// Èí±ÂåÖÂú∞ÂùÄÔºàBase58 Â≠óÁ¨¶‰∏≤Ôºâ
+extern char addr[128];
+
+// Èí±ÂåÖÁßÅÈí•Ôºà32 Â≠óËäÇÔºâ
+// ÁúüÂÆûÂÆûÁé∞‰∏çÂ∫îÊòéÊñá‰øùÂ≠òÔºåËøôÈáå‰∏∫‰∫ÜÂÆûÈ™å‰øùÊåÅ‰∏çÂèò
+extern unsigned char priv[32];
+
+// ËäÇÁÇπÂú® P2P ÁΩëÁªú‰∏≠ÁöÑÂú∞ÂùÄÔºà‰∏éÈí±ÂåÖÂú∞ÂùÄ‰∏çÂêåÔºâ
+extern char node_addr[128];
+
+// ËäÇÁÇπÁî®‰∫é P2P Ë∫´‰ªΩÈ™åËØÅÁöÑÂÖ¨Èí•
+extern unsigned char node_pubkey[65];
+extern size_t node_pubkey_len;
+
+// =======================
+//   ÂÖ®Â±ÄÂå∫ÂùóÈìæËøêË°åÁä∂ÊÄÅ
+// =======================
+
+// ÂÖ®Â±ÄÂå∫ÂùóÈìæÔºàÂú® main.c ÂàùÂßãÂåñÔºâ
+extern Blockchain* blockchain;
+
+// UTXO ÈõÜ
+extern UTXO* utxo_set;
+
+// ÂÖ®Â±ÄÂÜÖÂ≠òÊ±†
+extern Mempool mempool;
+
+//Èí±ÂåÖÂÖ¨Èí•ÂíåWIF
+unsigned char pub[65]; 
+size_t publen = 65;
+char wif[128];
+
+//------------------------------------------------------
+//     ÂàõÂª∫ coinbaseÔºàÊåñÁüøÂ•ñÂä±Ôºâ ‰∫§Êòì
+//------------------------------------------------------
+Tx* build_coinbase_tx(UTXO** utxo_set_ptr, Mempool* pool_ptr, const char* miner_addr)
+{
+    if (!miner_addr) 
+    {
+        return NULL;
     }
 
-    do {
-        ssize_t r = read(fd, priv, 32);
-        if (r != 32) {
-            // fallback to rand
-            for (int i = 0; i < 32; i++) priv[i] = rand() & 0xFF;
-        }
-    } while (!secp256k1_ec_seckey_verify(ctx, priv));
+    // Áî≥ËØ∑ coinbase ‰∫§ÊòìÁªìÊûÑ‰Ωì
+    Tx* tx = malloc(sizeof(Tx));
+    if (!tx) 
+    {
+        return NULL;
+    }
+    transaction_init(tx);     //ÂàùÂßãÂåñ‰∫§Êòì
 
-    close(fd);
+    // Coinbase ËæìÂÖ•‰∏∫Á©∫ÔºåÂè™ÊúâÂ•ñÂä±ËæìÂá∫
+    add_txout(tx, miner_addr, MINING_REWARD);
+
+    // coinbase Ê≠£Â∏∏ÊÉÖÂÜµ‰∏ã‰∏çÈúÄË¶ÅÁ≠æÂêçÔºå‰ΩøÁî® dummy ÁßÅÈí•‰øùÊåÅÁªü‰∏ÄÂ§ÑÁêÜ
+    unsigned char dummy_priv[32] = { 0 };
+    sign_tx(tx, dummy_priv);
+
+    // ËÆ°ÁÆó coinbase txid
+    tx_hash(tx, tx->txid);
+
+    // Â∞Ü coinbase Âä†ÂÖ• tx_pool
+    if (pool_ptr) {
+        tx_pool_add_tx(pool_ptr, tx, *utxo_set_ptr);
+    }
+
+    // ÊåñÁüøÂêéÁõ¥Êé•Êõ¥Êñ∞Êú¨Âú∞ UTXO‰Ωú‰∏∫ÁüøÂ∑•Â•ñÂä±
+    update_utxo_set(utxo_set_ptr, tx, tx->txid);
+
+    printf("[Coinbase] %u reward sent to %s\n", MINING_REWARD, miner_addr);
+    return tx;
 }
 
-// -----------------------------
-// »´æ÷◊¥Ã¨
-// -----------------------------
-//static Blockchain g_chain;
-//static UTXOSet g_utxos;
-//static TxPool g_txpool;
-//static Wallet g_wallet;
-//static int g_wallet_loaded = 0;
-//static P2PNetwork g_net;
 
-// -----------------------------
-// π¶ƒ‹∫Ø ˝
-// -----------------------------
-void show_blockchain() {
-    blockchain_print(&g_chain);
+//------------------------------------------------------
+// ÊûÑÈÄ† + ÊåñÊéòÂå∫ÂùóÔºàÁüøÂ∑•Ôºâ
+//------------------------------------------------------
+Block* build_and_mine_block()
+{
+    if (!blockchain) {
+        printf("[Mining] Error: chain not initialized.\n");
+        return NULL;
+    }
+    printf("[Mining] Constructing block...\n");
+
+    // Ëé∑ÂèñÈìæÂ∞æ
+    Blockchain* tail = blockchain;
+    while (tail->next) tail = tail->next;
+    Block* prev = tail->block;
+
+    // ÁîüÊàê‰∫§ÊòìÂ•ñÂä±
+    Tx* reward = build_coinbase_tx(&utxo_set, &mempool, addr);
+    if (!reward) {
+        printf("[Mining] coinbase build failed.\n");
+        return NULL;
+    }
+
+    // Ëé∑Âèñ txpool ‰∏≠t‰∫§ÊòìÁöÑÊï∞Èáè
+    int tx_count = 1;
+    MempoolTx* p = mempool.head;
+    while (p) { tx_count++; p = p->next; }
+
+    // ‰∏∫ block ÊûÑÈÄ† tx Êï∞ÁªÑÔºàÂú®Ê†à‰∏äÂàÜÈÖçÂêàÁêÜËåÉÂõ¥ÂÜÖÁöÑÊï∞ÁªÑÔºâ
+    Tx* txlist = malloc(sizeof(Tx) * tx_count);
+    if (!txlist) {
+        free(reward);
+        return NULL;
+    }
+    txlist[0] = *reward;
+    int i = 1;
+
+    p = mempool.head;
+
+    while (p) {
+        txlist[i++] = *(p->tx); 
+        p = p->next;
+    }
+
+    // ÂàõÂª∫block
+    Block* block = create_block(prev->header.block_hash, txlist, (uint32_t)tx_count);
+    if (!block) 
+    {
+        free(txlist);//ÈáäÊîæ
+        return NULL;
+    }
+    //ÂºÄÂßãÊåñÁüø
+    printf("[Mining] Start mining block...\n");
+    mine_block(block, 2);
+
+    // Âä†ÂÖ•Êú¨Âú∞Èìæ
+    blockchain = blockchain_add(blockchain, block);
+
+    //ÂπøÊí≠Áªôpeers
+    broadcast_block(block);
+
+    printf("[Mining] Block mined, %d transactions included.\n", tx_count);
+
+    free(txlist);
+    return block;
 }
 
-void show_utxo_set() {
-    utxo_set_print(&g_utxos);
-}
 
-void show_txpool() {
-    txpool_print(&g_txpool);
-}
-
-// ¥¥Ω®«Æ∞¸
-void create_wallet() {
-    if (wallet_create(&g_wallet) == 0) {
-        printf("wallet created!addr:%s\n", g_wallet.address);
-        // save wallet
-        if (wallet_save_keystore(&g_wallet, "keystore.json") == 0) {
-            printf("Wallet saved to keystore.json\n");
-        }
-        else {
-            printf("Failed to save wallet to keystore.json\n");
-        }
-        g_wallet_loaded = 1;
-    }
-    else {
-        printf("fail to create wallet!\n");
-    }
-}
-
-// º”‘ÿ«Æ∞¸£®¥” keystore.json£©
-void load_wallet() {
-    char path[256];
-    printf("Enter keystore path: ");
-    if (scanf("%s", path) != 1) {
-        printf("Invalid input!\n");
-        return;
-    }
-
-
-    if (wallet_load_keystore(&g_wallet, path) == 0) {
-        printf("Wallet loaded successfully! Address:%s\n", g_wallet.address);
-        g_wallet_loaded = 1;
-    }
-    else {
-        printf("Failed to load wallet!\n");
-    }
-}
-
-void show_wallet() {
-    if (!g_wallet_loaded) {
-        printf("Wallet not loaded£°\n");
-        return;
-    }
-    wallet_print(&g_wallet);
-}
-
-// ≤È—Ø”‡∂Ó
-void show_balance() {
-    if (!g_wallet_loaded) {
-        printf("Please create or load a wallet first!\n");
-        return;
-    }
-
-    uint64_t bal = utxo_set_get_balance(&g_utxos, g_wallet.address);
-    printf("Balance of %s: %lu satoshi\n", g_wallet.address, bal);
-}
-
-void create_transaction() {
-    if (!g_wallet_loaded) {
-        printf("Please create or load a wallet first!\n");
-        return;
-    }
-
-    char to_addr[64];
+//------------------------------------------------------
+// ÂàõÂª∫‰∫§Êòì
+//------------------------------------------------------
+void handle_user_transaction()
+{
+    char to_addr[128];
     uint64_t amount;
 
-    printf("Enter receiver address:  ");
-    if (scanf("%63s", to_addr) != 1) {
-        printf("Invalid input!\n");
+    printf("Enter address to send to: ");
+    if (scanf("%127s", to_addr) != 1) 
+    { 
+        while (getchar() != '\n'); 
+        return; 
+    }
+    printf("Enter amount: ");
+    if (scanf("%" SCNu64, &amount) != 1) 
+    { 
+        while (getchar() != '\n'); 
+        return;
+    }
+    while (getchar() != '\n');
+
+    //----ÂàõÂª∫‰∫§Êòì----
+    Tx* tx = create_transaction(&utxo_set, &mempool, addr, to_addr, amount, priv);
+
+    if (!tx) {
+        printf("[TX] Failed to build transaction.\n");
         return;
     }
 
-    printf("Enter amount (satoshi): ");
-    if (scanf("%lu", &amount) != 1) {
-        printf("Invalid input!\n");
-        return;
-    }
+    printf("[TX] Added transaction to tx_pool.\n");
 
+    // Ëá™Âä®Êåñ‰∏Ä‰∏™Âè™ÂåÖÂê´Ê≠§‰∫§ÊòìÁöÑÂå∫Âùó
+    Blockchain* tail = blockchain;
+    while (tail->next) tail = tail->next;
 
-    // ----- 1. ◊‘∂Ø—°±“ -----
-    UTXO selected[16];
-    size_t selected_count = 0;
-    uint64_t change = 0;
+    Block* prev = tail->block;
+    Tx txlist[1];
+    txlist[0] = *tx;
+    Block* b = create_block(prev->header.block_hash, txlist, 1);
+    printf("[Mining] Mining block for new TX...\n");
+    mine_block(b, 2);
+    blockchain = blockchain_add(blockchain, b);
+    broadcast_block(b);
 
-    if (utxo_set_select(&g_utxos, g_wallet.address, amount,
-        selected, 16, &selected_count, &change) != 0)
-    {
-        printf("Insufficient balance! Transaction failed.\n");
-        return;
-    }
-
-    printf("Selected %zu UTXOs, change = %lu\n", selected_count, change);
-
-
-    // ----- 2. ππΩ® TxIn -----
-    TxIn inputs[16];
-    uint64_t total_input_value = 0;
-
-    for (size_t i = 0; i < selected_count; i++) {
-        memcpy(inputs[i].txid, selected[i].txid, TXID_LEN);
-        inputs[i].vout = selected[i].vout;
-
-        total_input_value += selected[i].value;
-    }
-
-
-    // ----- 3. ππΩ® TxOut£®÷˜ ‰≥ˆ + ’“¡„ ‰≥ˆ£© -----
-
-    TxOut outputs[2];
-    memset(outputs, 0, sizeof(outputs));
-
-    // ÷˜ ‰≥ˆ
-    outputs[0].value = amount;
-    strlcpy(outputs[0].address, to_addr, BTC_ADDRESS_MAXLEN);
-
-    size_t out_count = 1;
-
-
-    // ----- 4. ¥¥Ω® Transaction£®◊‘∂Øº”’“¡„£© -----
-    Transaction tx;
-    transaction_init_with_change(&tx,
-        inputs, selected_count,      // inputs
-        outputs, out_count,          // outputs
-        total_input_value,           // total input value
-        g_wallet.address             // change address
-    );
-
-
-    // ----- 5. «©√˚ -----
-    transaction_sign(&tx, g_wallet.privkey);
-
-    printf("Transaction created, TxID (first 4 bytes): ");
-    for (int i = 0; i < 4; i++) printf("%02x", tx.txid[i]);
-    printf("...\n");
-
-
-    // ----- 6. º”»ÎΩª“◊≥ÿ -----
-    if (txpool_add(&g_txpool, &tx, &g_utxos)) {
-        printf("Transaction added to mempool.\n");
-    }
-    else {
-        printf("Failed to add transaction to mempool.\n");
-    }
-
-    // ----- 7. π„≤• transaction µΩ peers -----
-   // ππ‘Ïœ˚œ¢£∫ π”√πÃ∂®∏Ò Ω£®Message ‘⁄ p2p.h ∂®“Â£©
-    Message msg;
-    memset(&msg, 0, sizeof(msg));
-    msg.type = MSG_TX;
-    msg.payload_len = sizeof(Transaction);
-    if (msg.payload_len > MSG_BUF_SIZE) {
-        printf("Transaction size too large to broadcast\n");
-        return;
-    }
-    memcpy(msg.payload, &tx, msg.payload_len);
-
-    // π„≤•£®∫ˆ¬‘ ß∞‹£©
-    p2p_broadcast(&g_net, &msg);
-
-    printf("Transaction broadcast to peers.\n");
-
-
+    printf("[Block] New block mined .\n");
 }
 
-// Õ⁄øÛ£∫∞—Ωª“◊≥ÿÀ˘”–Ωª“◊¥Ú∞¸
-void mine_block() {
-    Block block;
-    block_init(&block);
 
-    printf("Start mining a new block...\n");
-
-    // 1. Add coinbase transaction
-    Transaction coinbase;
-    create_coinbase_tx(&coinbase, g_wallet.address, 5000000000ULL);  // 50 BTC
-    block_add_transaction(&block, &coinbase);
-
-    // Update UTXO with coinbase
-    utxo_set_update_from_tx(&g_utxos, &coinbase);
-
-    printf("Packing %zu transactions...\n", g_txpool.count);
-
-    for (size_t i = 0; i < g_txpool.count; i++) {
-        block_add_transaction(&block, &g_txpool.txs[i]);
-        // ∏¸–¬ utxo
-        utxo_set_update_from_tx(&g_utxos, &g_txpool.txs[i]);
+void start_as_server()
+{
+    if (running_as_miner) {
+        printf("[Info] Already running as server.\n");
+        return;
     }
 
-    // «Âø’Ωª“◊≥ÿ
-    g_txpool.count = 0;
+    running_as_miner = 1;
 
-    // º∆À„ Merkle root
-    compute_merkle_root(&block, block.header.merkle_root);
+    // ÂàõÂª∫Âπ∂ÊåñÊéòÂàõ‰∏ñÂå∫Âùó
+    Block* genesis = create_genesis_block(addr);
+    mine_block(genesis, 1);
+    blockchain = blockchain_add(NULL, genesis);
 
-    // Õ⁄øÛ
-    block_mine(&block, 2);
+    unsigned char genesis_txid[32];
+    tx_hash(&genesis->txs[0], genesis_txid);
 
-    // ÃÌº”«¯øÈ
-    blockchain_add_block(&g_chain, &block);
+    // ÁªôÁüøÂ∑•ÁîüÊàêÂàùÂßãUTXO
+    add_utxo(&utxo_set, genesis_txid, 0, addr, 0);
 
-    printf("Block mined! Current height: %zu\n", g_chain.block_count);
-}
+    printf("[Server] Genesis block created.\n");
 
-// ∆Ù∂Ø P2P º‡Ã˝
-void p2p_start() {
-    p2p_init(&g_net);
+    int port = 0;
     printf("Enter listen port: ");
-    if (scanf("%hu", &g_net.listen_port) != 1) {
-        printf("Invalid input!\n");
+    if (scanf("%d", &port) != 1) return;
+    while (getchar() != '\n');
+
+    start_server(port);
+    broadcast_addresss(addr, pub);
+
+    printf("[Server] Started successfully.\n");
+}
+
+
+void start_as_client()
+{
+    if (!running_as_miner && blockchain) {
+        printf("[Info] Already running as client.\n");
         return;
     }
 
+    running_as_miner = 0;
 
-    //p2p_init(&g_net);
-
-    pthread_t tid;
-    pthread_create(&tid, NULL, p2p_server_thread, &g_net);
-    pthread_detach(tid);
-
-    printf("P2P listener started.\n");
-}
-
-void p2p_connect() {
     char ip[64];
-    uint16_t port;
-    printf("Enter peer IP:  ");
-    if (scanf("%s", ip) != 1) {
-        printf("Invalid input!\n");
-        return;
-    }
+    int port = 0;
+    printf("Enter server IP: ");
+    if (scanf("%63s", ip) != 1) return;
 
-    printf("Enter peer port: ");
-    if (scanf("%hu", &port) != 1) {
-        printf("Invalid input!\n");
-        return;
-    }
+    printf("Enter server port: ");
+    if (scanf("%d", &port) != 1) return;
 
+    while (getchar() != '\n');
 
-    if (p2p_add_peer(&g_net, ip, port) == 0)
-        printf("Connected to peer.\n");
-    else
-        printf("Connection failed.\n");
+    connect_to_peer(ip, port);
+    broadcast_addresss(addr, pub);
+    printf("[Client] Connected to server.\n");
 }
 
-// -----------------------------
-// ≤Àµ•ΩÁ√Ê
-// -----------------------------
-void print_menu() {
-    printf("====================================\n");
-    printf("        My Bitcoin Experiment       \n");
-    printf("====================================\n");
-    printf("1. Show blockchain\n");
-    printf("2. Create transaction\n");
-    printf("3. Mine block\n");
-    printf("4. Show UTXO set\n");
-    printf("5. Create wallet\n");
-    printf("6. Load wallet\n");
-    printf("7. Show wallet info\n");
-    printf("8. Show balance\n");
-    printf("9. Show mempool\n");
-    printf("10. Start P2P listener\n");
-    printf("11. Connect to peer\n");
-    printf("0. Exit\n");
-    printf("Select option: (1-11,0) ");
-}
 
-int main(int argc, char* argv[]) {
-    (void)argc; (void)argv;
-    srand((unsigned)time(NULL));
-
-    secp256k1_context* ctx =
-        secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
-    crypto_secp_set_context(ctx);
-
-    //Blockchain* g_chain = malloc(sizeof(Blockchain));
-    
-    blockchain_init(&g_chain);
-    utxo_set_init(&g_utxos);
-    txpool_init(&g_txpool);
-
-    int choice;
-
+void bitcoin_menu()
+{
     while (1) {
-        print_menu();
+        printf("\n=============================\n");
+        printf("          BITCOIN            \n");
+        printf("=============================\n");
+        printf("[1] Run as Miner (server)\n");
+        printf("[2] Run as user (client)\n");
+        printf("[3] Create Transaction\n");
+        printf("[4] Mine Block\n");
+        printf("[5] Show Blockchain\n");
+        printf("[6] Show UTXO\n");
+        printf("[7] Show Tx_pool\n");
+        printf("[8] Balance Enquiry\n");
+        printf("[9] Exit The System\n");
+        printf("=============================\n");
+        printf("Enter num of function: ");
+
+        int choice = 0;
         if (scanf("%d", &choice) != 1) {
             while (getchar() != '\n');
-            printf("Invalid input!\n");
+            printf("Invalid input! Please try again.\n");
             continue;
         }
+        while (getchar() != '\n');
 
-        switch (choice) {
-        case 1: show_blockchain(); break;
-        case 2: create_transaction(); break;
-        case 3: mine_block(); break;
-        case 4: show_utxo_set(); break;
-        case 5: create_wallet(); break;
-        case 6: load_wallet(); break;
-        case 7: show_wallet(); break;
-        case 8: show_balance(); break;
-        case 9: show_txpool(); break;
-        case 10: p2p_start(); break;
-        case 11: p2p_connect(); break;
-        case 0:
-            printf("Exiting...\n");
-            return 0;
-        default:
-            printf("Invalid option!\n");
+        switch (choice)
+        {
+        case 1:
+            start_as_server();
+            break;
+
+        case 2:
+            start_as_client();
+            break;
+
+        case 3:
+            handle_user_transaction();
+            break;
+
+        case 4:
+            if (!running_as_miner) {
+                printf("[Error] You have no right or ability to mine.\n");
+                break;
+            }
+            build_and_mine_block();
+            break;
+
+        case 5:
+            blockchain_print(blockchain);
+            break;
+
+        case 6:
+            print_utxo_set(utxo_set);
+            break;
+
+        case 7:
+            tx_pool_print(&mempool);
+            break;
+
+        case 8: {
+            uint64_t bal = get_balance(utxo_set, addr);
+            //printf("%s", addr);
+            printf("Balance = %" PRIu64 "\n",  bal);
+            break;
         }
 
-        printf("\n");
+        case 9:
+            printf("Exiting the system.\n");
+            p2pstop();
+            exit(0);
+
+        default:
+            printf("Invalid option, Please try again!\n");
+        }
     }
-
-    /*printf("=== Integration test: minimal bitcoin demo ===\n\n");
-    // ============================
-    // 1. Create two wallets
-    // ============================
-    printf("=== 1. Create Wallets (Alice / Bob) ===\n");
-
-    Wallet alice, bob;
-
-    if (wallet_create(&alice) != 0) {
-        printf("Failed to create Alice wallet!\n");
-        return 1;
-    }
-    if (wallet_create(&bob) != 0) {
-        printf("Failed to create Bob wallet!\n");
-        return 1;
-    }
-
-    char alice_priv_hex[WALLET_KEY_HEX_LEN + 1];
-    char bob_priv_hex[WALLET_KEY_HEX_LEN + 1];
-
-    wallet_privkey_to_hex(&alice, alice_priv_hex);
-    wallet_privkey_to_hex(&bob, bob_priv_hex);
-
-    //printf("Alice Address = %s\n", alice.address);
-    //printf("Alice PrivKey = %s\n", alice_priv_hex);
-
-    //printf("Bob   Address = %s\n", bob.address);
-    //zheli printf("Bob   PrivKey = %s\n\n", bob_priv_hex);
-    // ============================
-    // 2. Initialize UTXO Set with genesis UTXOs
-    // ============================
-    printf("=== 2. Initialize UTXO Set (Genesis) ===\n");
-
-    UTXOSet utxos;
-    utxo_set_init(&utxos);
-
-    // ---- Simulate genesis: give Alice 50 BTC ----
-    UTXO g1 = { 0 };
-    // fake txid (32 bytes)
-    for (int i = 0; i < TXID_LEN; i++) g1.txid[i] = i;
-    g1.vout = 0;
-    g1.value = 50 * 100000000ULL;    // 50 BTC
-    strncpy(g1.address, alice.address, ADDR_LEN - 1);
-
-    utxo_set_add(&utxos, &g1);
-
-    //printf("Added genesis UTXO: 50 BTC to Alice\n\n");
-
-    // ---- Print UTXO set ----
-    //utxo_set_print(&utxos);
-
-    // ---- Show balances ----
-    uint64_t alice_bal = utxo_set_get_balance(&utxos, alice.address);
-    uint64_t bob_bal = utxo_set_get_balance(&utxos, bob.address);
-
-    //printf("\nAlice Balance = %.8f BTC\n", alice_bal / 100000000.0);
-    //printf("Bob   Balance = %.8f BTC\n\n", bob_bal / 100000000.0);
-    
-
-    printf("\n=== Demo finished ===\n");
-    */
-
-    return 0;
 }
 
-   /* Transaction tx; memset(&tx, 0, sizeof(tx));
-    tx.input_count = 1;
-    memset(tx.inputs[0].txid, 0xab, TXID_LEN);
-    tx.inputs[0].vout = 0;
-    tx.output_count = 1;
-    tx.outputs[0].value = 1000;
-    strncpy(tx.outputs[0].address, "1AliceAddr...", BTC_ADDRESS_MAXLEN);
 
-    transaction_compute_txid(&tx);
-
-    //Sign not necessary for serialize test, but can fill pubkey/sig 
-    uint8_t buf[4096];
-    size_t n = transaction_serialize(&tx, buf, sizeof(buf));
-    Transaction tx2;
-    transaction_deserialize(&tx2, buf, n);
-    transaction_print(&tx);
-    transaction_print(&tx2);
-    */
-    /*
-    printf("==== test ====\n\n");
-
-    // -----------------------------------------
-    // 1. …˙≥…”√ªß«Æ∞¸£∫Alice & Bob
-    // -----------------------------------------
-    uint8_t privA[32], privB[32];
-    uint8_t pubA[33], pubB[33];
-    char addrA[BTC_ADDRESS_MAXLEN];
-    char addrB[BTC_ADDRESS_MAXLEN];
-
-    random_privkey(privA);
-    random_privkey(privB);
-
-    ecdsa_get_pubkey(privA, pubA);
-    ecdsa_get_pubkey(privB, pubB);
-
-    pubkey_to_address(pubA, addrA);
-    pubkey_to_address(pubB, addrB);
-
-    printf("Alice Address = %s\n", addrA);
-    printf("Bob   Address = %s\n\n", addrB);
-
-    // -----------------------------------------
-    // 2. ≥ı ºªØƒ£øÈ
-    // -----------------------------------------
-    UTXOSet utxos;
-    utxo_set_init(&utxos);
-
-    TxPool pool;
-    txpool_init(&pool);
-
-    // -----------------------------------------
-    // 3. ¥¥Ω®°∞¥¥ ¿UTXO°±£∫∏¯ Alice 50 BTC
-    // -----------------------------------------
-    Transaction coinbase;
-    uint8_t zero_txid[32] = { 0 };
-    TxIn cb_in;
-    memset(&cb_in, 0, sizeof(cb_in));
-    memcpy(cb_in.txid, zero_txid, TXID_LEN);
-    cb_in.vout = 0;
-
-    TxOut out_cb = {
-        .value = 50ull * 100000000ull,   // 50 BTC
-    };
-    strncpy(out_cb.address, addrA, BTC_ADDRESS_MAXLEN);
-
-    transaction_init(&coinbase, &cb_in, 1, &out_cb, 1);
-
-    utxo_set_update_from_tx(&utxos, &coinbase);
-
-    printf("=== UTXO ===\n");
-    utxo_set_print(&utxos);
-
-    // -----------------------------------------
-    // 4. Alice °˙ Bob ◊™’À 20 BTC
-    // -----------------------------------------
-    Transaction tx1;
-
-    TxOut out1 = {
-        .value = 20ull * 100000000ull,
-    };
-    strncpy(out1.address, addrB, BTC_ADDRESS_MAXLEN);
-
-    // ’“µΩ Alice µƒ UTXO
-    UTXO* u = utxo_set_find(&utxos, coinbase.txid, 0);
-    if (!u) {
-        printf("couldn't find UTXO£¨stop\n");
-        return 0;
-    }
-
-    TxIn in1;
-    memset(&in1, 0, sizeof(in1));
-    memcpy(in1.txid, u->txid, TXID_LEN);
-    in1.vout = u->vout;
-
-    transaction_init_with_change(&tx1, &in1, 1, &out1, 1, u->value, addrA);
-
-    // Alice Ω¯––«©√˚
-    if (!transaction_sign(&tx1, privA)) {
-        printf("fail to sign transaction\n");
-        return 0;
-    }
-
-    printf("\n=== Alice°˙Bob tx ===\n");
-    transaction_print(&tx1);
-
-    // —È÷§
-    if (!transaction_verify(&tx1)) {
-        printf("fail to verify!\n");
-        return 0;
-    }
-
-    printf("successful signature verification °Ã\n");
-
-    // -----------------------------------------
-    // 5. Ω´Ωª“◊º”»Î TxPool£®◊‘∂Ø÷¥–– UTXO ºÏ≤È+«©√˚—È÷§£©
-    // -----------------------------------------
-    if (!txpool_add(&pool, &tx1, &utxos)) {
-        printf("fail to join txpool£°\n");
-        return 0;
-    }
-
-    printf("\n=== Txpool ===\n");
-    txpool_print(&pool);
-
-    // -----------------------------------------
-    // 6. ∏¸–¬UTXO
-    // -----------------------------------------
-    utxo_set_update_from_tx(&utxos, &tx1);
-
-    printf("\n=== UTXO after tx1 ===\n");
-    utxo_set_print(&utxos);
-
-    // -----------------------------------------
-    // 7. ≤È—Ø”‡∂Ó
-    // -----------------------------------------
-    printf("\n=== balance enquiry ===\n");
-    printf("Alice: %llu sat\n", (unsigned long long)utxo_set_get_balance(&utxos, addrA));
-    printf("Bob:   %llu sat\n", (unsigned long long)utxo_set_get_balance(&utxos, addrB));
-    // -----------------------------------------
-// 8. ≤‚ ‘£∫Alice ”–¡Ω∏ˆ100BTCµƒUTXO£¨◊™∏¯ Bob 150BTC
-// -----------------------------------------
-    printf("\n\n==============================\n");
-    printf("=== Test Multi-Input TX ===\n");
-    printf("==============================\n");
-
-    // «Âø’UTXO
-    utxo_set_init(&utxos);
-
-    //
-    // UTXO #0: 100 BTC °˙ Alice
-    //
-    Transaction txA0;
-    memset(&txA0, 0, sizeof(txA0));
-
-    uint8_t zero_txid2[32] = { 0 };
-    TxIn cb_in2;
-    memset(&cb_in2, 0, sizeof(cb_in2));
-    memcpy(cb_in2.txid, zero_txid2, TXID_LEN);
-    cb_in2.vout = 0;
-    TxOut outA0 = { .value = 100ull * 100000000ull };
-    strncpy(outA0.address, addrA, BTC_ADDRESS_MAXLEN);
-
-    transaction_init(&txA0, &cb_in2, 1, &outA0, 1);
-    utxo_set_update_from_tx(&utxos, &txA0);
-
-    //
-    // UTXO #1: 100 BTC °˙ Alice
-    //
-    Transaction txA1;
-    memset(&txA1, 0, sizeof(txA1));
-
-    uint8_t zero_txid3[32] = { 0 };
-    TxIn cb_in3;
-    memset(&cb_in3, 0, sizeof(cb_in3));
-    memcpy(cb_in3.txid, zero_txid3, TXID_LEN);
-    cb_in3.vout = 0;
-    TxOut outA1 = { .value = 100ull * 100000000ull };
-    strncpy(outA1.address, addrA, BTC_ADDRESS_MAXLEN);
-
-    transaction_init(&txA1, &cb_in3, 1, &outA1, 1);
-    utxo_set_update_from_tx(&utxos, &txA1);
-
-    printf("\n=== Alice initial UTXOs (2 °¡ 100BTC) ===\n");
-    utxo_set_print(&utxos);
-
-    // -----------------------------------------
-    // —°±“ 150 BTC£®Ω´◊‘∂Ø—°µΩ¡Ω∏ˆUTXO£©
-    // -----------------------------------------
-    uint64_t amount_send = 150ull * 100000000ull;
-
-    UTXO selected2[10];
-    size_t selected2_count = 0;
-    uint64_t change2 = 0;
-
-    if (utxo_set_select(&utxos, addrA, amount_send,
-        selected2, 10, &selected2_count, &change2) != 0)
-    {
-        printf("fail selcet!\n");
-        return 0;
-    }
-
-    printf("\n=== Selected inputs for 150 BTC ===\n");
-    for (size_t i = 0; i < selected2_count; i++) {
-        printf("  Input %zu: %llu sat\n",
-            i, (unsigned long long)selected2[i].value);
-    }
-    printf("’“¡„ = %llu sat (%.8f BTC)\n",
-        (unsigned long long)change2, change2 / 100000000.0);
-
-    // -----------------------------------------
-    // ππ‘Ï’Ê’˝µƒ∂‡ ‰»Î°¢∂‡ ‰≥ˆΩª“◊
-    // -----------------------------------------
-    Transaction tx2;
-    memset(&tx2, 0, sizeof(tx2));
-
-    // ----  ‰»Î ----
-    tx2.input_count = selected2_count;
-
-    for (size_t i = 0; i < selected2_count; i++) {
-        memcpy(tx2.inputs[i].txid, selected2[i].txid, TXID_LEN);
-        tx2.inputs[i].vout = selected2[i].vout;
-    }
-
-    // ----  ‰≥ˆ£∫150 BTC -> Bob ----
-    TxOut outBob = { .value = amount_send };
-    strncpy(outBob.address, addrB, BTC_ADDRESS_MAXLEN);
-
-    // ----  ‰≥ˆ£∫’“¡„ -> Alice ----
-    TxOut outChange = { .value = change2 };
-    strncpy(outChange.address, addrA, BTC_ADDRESS_MAXLEN);
-
-    tx2.outputs[0] = outBob;
-    tx2.outputs[1] = outChange;
-    tx2.output_count = 2;
-
-    // º∆À„ TxID
-    transaction_compute_txid(&tx2);
-
-    // «©√˚
-    if (!transaction_sign(&tx2, privA)) {
-        printf("tx2 sign fail!\n");
-        return 0;
-    }
-
-    if (!transaction_verify(&tx2)) {
-        printf("tx2 verify fail!\n");
-        return 0;
-    }
-
-    printf("\n=== Alice °˙ Bob 150 BTC (Multi-input TX) ===\n");
-    transaction_print(&tx2);
-
-    // -----------------------------------------
-    // ∏¸–¬UTXO
-    // -----------------------------------------
-    utxo_set_update_from_tx(&utxos, &tx2);
-
-    printf("\n=== UTXO set after transfer ===\n");
-    utxo_set_print(&utxos);
-
-    // -----------------------------------------
-    // ≤È—Ø”‡∂Ó
-    // -----------------------------------------
-    printf("\n=== Final Balance ===\n");
-    printf("Alice: %llu sat\n",
-        (unsigned long long)utxo_set_get_balance(&utxos, addrA));
-    printf("Bob:   %llu sat\n",
-        (unsigned long long)utxo_set_get_balance(&utxos, addrB));
-        */
-    /* printf("\n=== Test Block & Mining ===\n");
-
-    // -----------------------------
-    // 1. ≥ı ºªØ¥¥ ¿øÈ
-    // -----------------------------
-    Block genesis;
-    memset(&genesis, 0, sizeof(genesis));
-    genesis.header.version = 1;
-    memset(genesis.header.prev_block, 0, BLOCK_HASH_LEN);
-
-    // ºŸ…Ë“—”– coinbase Ωª“◊
-    Transaction coinbase;
-    memset(&coinbase, 0, sizeof(coinbase));
-    coinbase.output_count = 1;
-    coinbase.outputs[0].value = 50ull * 100000000ull; // 50 BTC
-    strncpy(coinbase.outputs[0].address, "Alice", BTC_ADDRESS_MAXLEN);
-    transaction_compute_txid(&coinbase);
-
-    genesis.tx_count = 1;
-    genesis.txs[0] = coinbase;
-
-    uint8_t merkle[BLOCK_HASH_LEN];
-    compute_merkle_root(&genesis, merkle);
-    memcpy(genesis.header.merkle_root, merkle, BLOCK_HASH_LEN);
-
-    printf("[DEBUG] Genesis Merkle Root: ");
-    for (int i = 0; i < BLOCK_HASH_LEN; i++) printf("%02x", genesis.header.merkle_root[i]);
-    printf("\n");
-
-    // Õ⁄øÛƒ—∂»£∫«∞2◊÷Ω⁄Œ™0
-    block_mine(&genesis, 2);
-
-    block_print(&genesis);
-
-    // -----------------------------
-    // 2. ÃÌº”–¬«¯øÈ
-    // -----------------------------
-    Block block1;
-    memset(&block1, 0, sizeof(block1));
-    block1.header.version = 1;
-    memcpy(block1.header.prev_block, genesis.block_hash, BLOCK_HASH_LEN);
-
-    // ºŸ…Ë“—”–Ωª“◊ tx1
-    Transaction tx1;
-    memset(&tx1, 0, sizeof(tx1));
-    tx1.output_count = 1;
-    tx1.outputs[0].value = 20ull * 100000000ull;
-    strncpy(tx1.outputs[0].address, "Bob", BTC_ADDRESS_MAXLEN);
-    transaction_compute_txid(&tx1);
-
-    block1.tx_count = 1;
-    block1.txs[0] = tx1;
-
-    compute_merkle_root(&block1, block1.header.merkle_root);
-
-    printf("[DEBUG] Block1 Merkle Root: ");
-    for (int i = 0; i < BLOCK_HASH_LEN; i++) printf("%02x", block1.header.merkle_root[i]);
-    printf("\n");
-
-    // Õ⁄øÛ
-    block_mine(&block1, 2);
-
-    block_print(&block1);
-    
-    // -----------------------------
-    // 3. ¡¥ Ω¥Ú”°//±∏◊¢£¨÷ª”√∂ØÃ¨∑÷≈‰≤≈ƒ‹’˝≥£‘À––£¨∑Ò‘Úª·≥ˆœ÷Segmentation fault (core dumped)£¨º¥ πºı–°MAX_BLOCKS“≤≤ª––
-    // -----------------------------
-    Blockchain* chain = malloc(sizeof(Blockchain));
-    if (!chain) { perror("malloc"); exit(1); }
-    blockchain_init(chain);
-    blockchain_add_block(chain, &genesis);
-    blockchain_add_block(chain, &block1);
-    
-    printf("\n=== Blockchain ===\n");
-    blockchain_print(chain);
-    
-    free(chain);
-    */
-     
-
-
-    /*if (argc < 2) {
-        printf("Usage: %s <port> [peer_ip:peer_port]\n", argv[0]);
-        return 1;
-    }
-
-    uint16_t port = atoi(argv[1]);
-
-    P2PNetwork net;
-    p2p_init(&net);
-    net.listen_port = port;
-    // ∆Ù∂Ø server œﬂ≥Ã
-    pthread_t server_tid;
-    pthread_create(&server_tid, NULL, p2p_server_thread, &net);
-    pthread_detach(server_tid);
-
-    // ¡¨Ω”∆‰À˚Ω⁄µ„£®ø…—°£©
-    if (argc >= 3) {
-        char ip[32];
-        uint16_t peer_port;
-        sscanf(argv[2], "%31[^:]:%hu", ip, &peer_port);
-        p2p_add_peer(&net, ip, peer_port);
-    }*/
-
-
-
-
-
-
-
-
-
-    /*    // ∆Ù∂Øœﬂ≥Ãº‡Ã˝£®ºŸ…ËŒ“√«”√Õ¨“ª∏ˆ≥Ã–Ú¡¨Ω”ªÿ◊‘º∫ƒ£ƒ‚£©
-    for (size_t i = 0; i < net.peer_count; i++) {
-        pthread_t tid;
-        pthread_create(&tid, NULL, p2p_handle_incoming, &net.peers[i]);
-        pthread_detach(tid);
-    }
-
-    // ºÚµ•∑¢ÀÕ ping ≤‚ ‘
-    sleep(1);
-    Message ping = { .type = MSG_PING, .payload_len = 0 };
-    p2p_broadcast(&net, &ping);
-
-    printf("Press Ctrl+C to exit\n");
-    while (1) sleep(1);*/
-    // ºÚµ•≤‚ ‘£∫√ø 5 √Îπ„≤• PING
-    /*while (1) {
-        Message ping = { .type = MSG_PING, .payload_len = 0 };
-        p2p_broadcast(&net, &ping);
-        sleep(5);
-    }
-    
-    
-    return 0;
-}*/
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-/*
 int main()
 {
-    printf("==== Bitcoin Mini Project ====\n\n");
+    // ÂàùÂßãÂåñÂÖ®Â±ÄÂèòÈáè
+    global_init();
+    tx_pool_init(&mempool);
 
-    //
-    // 1. ≥ı ºªØΩª“◊≥ÿ”Î UTXO ºØ∫œ
-    //
-    TxPool pool;
-    txpool_init(&pool);
+    // ÁîüÊàêÁßÅÈí•„ÄÅÂÖ¨Èí•„ÄÅÂú∞ÂùÄ
+    generate_privkey(priv);
+    privkey_to_pubkey_and_addr(priv, pub, &publen, addr, sizeof(addr), 1);
+    privkey_to_WIF(priv, 32, 1, wif, sizeof(wif));
 
-    UTXOSet utxo;
-    utxo_set_init(&utxo);
+    printf("Wallet Address: %s\n", addr);
+    printf("WIF: %s\n\n", wif);
 
-    printf("Initialized TxPool and UTXOSet.\n");
+    set_node_address(addr, pub);
 
-    //
-    // 2. ¥¥Ω® coinbase Ωª“◊ tx1
-    //
-    TxOut outs1[2] = {
-        {.value = 5000000000ULL, .address = "Alice"},
-        {.value = 1000000000ULL, .address = "Bob"}
-    };
-
-    uint8_t ZERO_PREV[TXID_LEN] = { 0 };
-
-    Transaction tx1;
-    transaction_init(&tx1, ZERO_PREV, 0, outs1, 2);
-    transaction_compute_txid(&tx1);
-
-    printf("\nCreated transaction tx1:\n");
-    transaction_print(&tx1);
-
-    //
-    // 3. ∞— tx1 ÃÌº”µΩΩª“◊≥ÿ£®ª·◊‘∂Ø ∂±Œ™ coinbase£©
-    //
-    printf("\nAdding tx1 to TxPool...\n");
-    txpool_add(&pool, &tx1, &utxo);
-
-    //
-    // 4. ∏¸–¬ UTXO£®∑≈»Î tx1 µƒ ‰≥ˆ£©
-    //
-    printf("Applying tx1 to UTXO...\n");
-    utxo_set_update_from_tx(&utxo, &tx1);
-
-    //
-    // 5. ¥¥Ω® tx2£¨ª®∑— tx1 µƒ vout = 0£®Alice µƒƒ«± £©
-    //
-    TxOut outs2[1] = {
-        {.value = 2000000000ULL, .address = "Charlie"}
-    };
-
-    Transaction tx2;
-    transaction_init(&tx2, tx1.txid, 0, outs2, 1);
-    transaction_compute_txid(&tx2);
-
-    printf("\nCreated transaction tx2:\n");
-    transaction_print(&tx2);
-
-    //
-    // 6. œ÷‘⁄ utxo ÷–“—æ≠∞¸∫¨ tx1 µƒ ‰≥ˆ£¨“Ú¥À tx2 ƒ‹À≥¿˚º”»ÎΩª“◊≥ÿ
-    //
-    printf("\nAdding tx2 to TxPool...\n");
-    txpool_add(&pool, &tx2, &utxo);
-
-    //
-    // 7. ”¶”√ tx2 ∏¸–¬ UTXO
-    //
-    printf("Applying tx2 to UTXO...\n");
-    utxo_set_update_from_tx(&utxo, &tx2);
-
-    //
-    // 8. ¥Ú”°Ωª“◊≥ÿ
-    //
-    printf("\n===== TxPool =====\n");
-    txpool_print(&pool);
-    printf("\n=== Balance Check ===\n");
-    printf("Alice:   %llu\n", (unsigned long long)utxo_set_get_balance(&utxo, "Alice"));
-    printf("Bob:     %llu\n", (unsigned long long)utxo_set_get_balance(&utxo, "Bob"));
-    printf("Charlie: %llu\n", (unsigned long long)utxo_set_get_balance(&utxo, "Charlie"));
-
-    //
-    // 9. ¥Ú”°◊Ó÷’ UTXO ºØ∫œ
-    //
-    printf("\n===== Final UTXO Set =====\n");
-    utxo_set_print(&utxo);
-
-    printf("\nDone.\n");
+    // ËøõÂÖ•ËèúÂçï
+    bitcoin_menu();
     return 0;
 }
-*/
-
-
-
-
-
-
-
-
-
-
 
 
 /*
-int main() {
-    // ≥ı ºªØ«Æ∞¸
-    Wallet w1, w2;
-    wallet_create(&w1);
-    wallet_create(&w2);
+// ===== ‰∏ªËèúÂçï =====
+void bitcoin_menu()
+{
+    while (1) {
+        printf("\n=============================\n");
+        printf("----bitcoin---- \n");
+        printf("=============================\n");
+        printf("1. Create Transaction\n");
+        printf("2. Show Balance\n");
+        printf("3. Mine Block\n");
+        printf("4. Show Blockchain\n");
+        printf("5. Show UTXO\n");
+        printf("6. Show tx_pool\n");
+        printf("7. Exit\n");
+        printf("=============================\n");
+        printf("Enter choice: ");
 
-    printf("=== Wallets ===\n");
-    wallet_print(&w1);
-    wallet_print(&w2);
+        int choice = 0;
+        if (scanf("%d", &choice) != 1) {
+            while (getchar() != '\n');
+            printf("Invalid input\n");
+            continue;
+        }
+        while (getchar() != '\n');
 
-    // ≥ı ºªØ UTXO ºØ
-    UTXOSet utxos;
-    utxo_set_init(&utxos);
+        
+        switch (choice)
+        {
+        case 1:
+            handle_user_transaction();
+            break;
 
-    // ∏¯ w1 “ª∏ˆ≥ı º UTXO£®¥¥ ¿øÈƒ£ƒ‚Ω±¿¯£©
-    UTXO coinbase_utxo;
-    memset(&coinbase_utxo, 0, sizeof(coinbase_utxo));
-    coinbase_utxo.value = 5000000000; // 50 BTC
-    coinbase_utxo.vout = 0;
-    memset(coinbase_utxo.txid, 0x01, TXID_LEN); // ƒ£ƒ‚¥¥ ¿Ωª“◊ID
-    strncpy(coinbase_utxo.address, w1.address, ADDR_LEN - 1);
-    coinbase_utxo.address[ADDR_LEN - 1] = '\0';
-    coinbase_utxo.address[ADDR_LEN - 1] = '\0';
-    utxo_set_add(&utxos, &coinbase_utxo);
+        case 2: {
+            uint64_t bal = get_balance(utxo_set, addr);
+            printf("Balance(%s) = %" PRIu64 "\n", addr, bal);
+            break;
+        }
 
-    printf("\nInitial UTXO set:\n");
-    utxo_set_print(&utxos);
+        case 3:
+            if (!running_as_miner) { printf("Only server can mine.\n"); break; }
+            build_and_mine_block();
+            break;
 
-    // ππ‘Ï“ª± Ωª“◊£∫w1 -> w2
-    TxOut outputs[1];
-    outputs[0].value = 3000000000; // 30 BTC
-    strncpy(outputs[0].address, w2.address, BTC_ADDRESS_MAXLEN - 1);
-    outputs[0].address[BTC_ADDRESS_MAXLEN - 1] = '\0';
+        case 4:
+            blockchain_print(blockchain);
+            break;
 
-    Transaction tx;
-    transaction_init(&tx, coinbase_utxo.txid, coinbase_utxo.vout, outputs, 1);
-    transaction_compute_txid(&tx);
+        case 5:
+            print_utxo_set(utxo_set);
+            break;
 
-    printf("\nTransaction created:\n");
-    transaction_print(&tx);
+        case 6:
+            tx_pool_print(&mempool);
+            break;
 
-    // ∏¸–¬ UTXO ºØ
-    utxo_set_update_from_tx(&utxos, &tx);
+        case 7:
+            printf("Exiting...\n");
+            p2pstop();
+            exit(0);
 
-    printf("\nUTXO set after transaction:\n");
-    utxo_set_print(&utxos);
+        default:
+            printf("Invalid option.\n");
+        }
+    }
+}
+
+int main()
+{
+    //ÂàùÂßãÂåñÂÖ®Â±ÄÂèòÈáè
+    global_init();
+
+    tx_pool_init(&mempool);
+
+    // ‰ΩøÁî®walletÂäüËÉΩÁîüÊàêÁßÅÈí•
+    generate_privkey(priv);
+    // ÁßÅÈí•ÁîüÊàêÂÖ¨Èí•ÂíåÂú∞ÂùÄ
+    privkey_to_pubkey_and_addr(priv, pub, &publen, addr, sizeof(addr), 1);
+    // ÁßÅÈí•ÁîüÊàêWIF
+    privkey_to_WIF(priv, 32, 1, wif, sizeof(wif));
+
+    printf("Wallet Address: %s\n", addr);
+    printf("WIF: %s\n\n", wif);
+    set_node_address(addr, pub);
+
+    int mode = 0;
+    printf("Select mode: 1 = server, 2 = client: ");
+    if (scanf("%d", &mode) != 1) return 1;
+    while (getchar() != '\n');
+
+    if (mode == 1) {
+        running_as_miner = 1;
+
+        // ÂàõÂª∫Âπ∂ÊåñÊéòÂàõ‰∏ñÂå∫Âùó
+        Block* genesis = create_genesis_block(addr);
+        mine_block(genesis, 1);
+        blockchain = blockchain_add(NULL, genesis);
+
+        unsigned char genesis_txid[32];
+        tx_hash(&genesis->txs[0], genesis_txid);
+
+        // Âàõ‰∏ñÂå∫ÂùóÁªô addr ‰∏Ä‰∏™ UTXOÔºåÂπ∂Áªô50‰Ωú‰∏∫ÂàùÂßã
+        add_utxo(&utxo_set, genesis_txid, 0, addr, 50);
+
+        printf("[Server] Genesis block created.\n");
+
+        int port = 0;
+        printf("Enter listen port: ");
+        if (scanf("%d", &port) != 1) return 1;
+        while (getchar() != '\n');
+
+        start_server(port);
+        broadcast_addresss(addr, pub);
+    }
+    else {
+        running_as_miner = 0;
+
+        char ip[64];
+        int port = 0;
+        printf("Enter server IP: "); if (scanf("%63s", ip) != 1) return 1;
+        printf("Enter server port: "); if (scanf("%d", &port) != 1) return 1;
+        while (getchar() != '\n');
+
+        connect_to_peer(ip, port);
+        broadcast_addresss(addr, pub);
+    }
+
+    // ËèúÂçïÂæ™ÁéØÔºà‰∏ªÁ∫øÁ®ãÔºâ
+    bitcoin_menu();
 
     return 0;
 }*/

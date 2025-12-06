@@ -397,7 +397,8 @@ void* peer_thread(void* arg)
                     if (is_server) {
                         if (temp == 0) {
                             temp = 1;
-                            printf("[P2P] Peer %d address: %s\n", sock, peer_addrs[idx]);
+                            //printf("[P2P] Peer %d address: %s\n", sock, peer_addrs[idx]);
+                            printf("[P2P] Peer  address: %s\n", peer_addrs[idx]);
 
                         }
                     }

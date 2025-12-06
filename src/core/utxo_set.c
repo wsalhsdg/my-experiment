@@ -3,39 +3,18 @@
 #include <string.h>
 #include <stdio.h>
 
-// ----Óà¶î²éÑ¯----
-uint64_t get_balance(const UTXO* utxo_set, const char* addr) {
-    uint64_t sum = 0;
-    const UTXO* cur = utxo_set;
 
-    while (cur) {
-        if (strcmp(cur->addr, addr) == 0) {
-            sum += cur->amount;
-        }
-        cur = cur->next;
-    }
-    return sum;
-}
-
-// ----Óà¶îÊÇ·ñ³ä×ã----
-int has_sufficient_balance(const UTXO* utxo_set, 
-                           const char* from_addr,
-                           uint64_t amount) 
-{
-    uint64_t bal = get_balance(utxo_set, from_addr);
-    return bal >= amount;
-}
 
 // ----Ìí¼ÓUTXO----
 void add_utxo(UTXO** utxo_set, const unsigned char txid[32], uint32_t index, const char* addr, uint32_t amount) 
 {
-    UTXO* node = malloc(sizeof(UTXO));
+    UTXO* node = malloc(sizeof(UTXO)+1);
 
     if (!node) return;
 
     memcpy(node->txid, txid, 32);
     node->output_index = index;
-    snprintf(node->addr, sizeof(node->addr), "%s", addr); 
+    snprintf(node->addr, 128, "%s", addr); 
     node->amount = amount;
 
     node->next = *utxo_set;     // ÐÂ½Úµã¹Òµ½Á´±íÍ·
@@ -43,6 +22,31 @@ void add_utxo(UTXO** utxo_set, const unsigned char txid[32], uint32_t index, con
     *utxo_set = node;
 }
 
+// ----Óà¶î²éÑ¯----
+uint64_t get_balance(const UTXO* utxo_set, const char* addr) {
+    uint64_t sum = 0;
+    const UTXO* cur = utxo_set;
+
+    while (cur) {
+        //printf("cur=%s\n", cur->addr);
+        if (strcmp(cur->addr, addr) == 0) {
+            sum += cur->amount;
+            printf("amount=%d\n", cur->amount);
+        }
+        
+        cur = cur->next;
+    }
+    return sum;
+}
+
+// ----Óà¶îÊÇ·ñ³ä×ã----
+int has_sufficient_balance(const UTXO* utxo_set,
+    const char* from_addr,
+    uint64_t amount)
+{
+    uint64_t bal = get_balance(utxo_set, from_addr);
+    return bal >= amount;
+}
 
 // ----²éÑ¯UTXO----
 UTXO* find_utxo(UTXO* utxo_set, const unsigned char txid[32], uint32_t index) 
@@ -113,11 +117,13 @@ void print_utxo_set(const UTXO* utxo_set) {
     const UTXO* cur = utxo_set;
     printf("UTXO set:\n");
     while (cur) {
-        printf("  Addr=%s, Amount=%u, TxID=", cur->addr, cur->amount);
+        printf("  Addr=%s\n", cur->addr);
+        printf("  Amount=%u\n", cur->amount);
+        printf("  TxID=");
         for (int i = 0; i < 32; i++) {
             printf("%02X", cur->txid[i]);
         }
-        printf(", Index=%u\n", cur->output_index);
+        printf("\n  Index=%u\n\n", cur->output_index);
         cur = cur->next;
     }
 }

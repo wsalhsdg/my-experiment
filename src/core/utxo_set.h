@@ -9,7 +9,7 @@ typedef struct UTXONode {
     unsigned char txid[32];     // 交易ID
     uint32_t output_index;      // 输出索引
     uint32_t amount;            // 交易金额
-    char addr[35];              // 收款地址
+    char addr[128];              // 收款地址
     struct UTXONode* next;      // 下一个节点
 } UTXO;
 
