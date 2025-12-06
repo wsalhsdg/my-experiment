@@ -1,381 +1,163 @@
-#include "utxo_set.h"
-#include <stdio.h>
+#include "core/utxo_set.h"
+#include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
-/* 初始化 */
-void utxo_set_init(UTXOSet* utxos) {
-    if (!utxos) return;
-    utxos->count = 0;
-    memset(utxos->set, 0, sizeof(utxos->set));
-}
+// ----余额查询----
+uint64_t get_balance(const UTXO* utxo_set, const char* addr) {
+    uint64_t sum = 0;
+    const UTXO* cur = utxo_set;
 
-/* 添加 */
-int utxo_set_add(UTXOSet* utxos, const UTXO* utxo) {
-    if (!utxos || !utxo) return -1;
-    if (utxos->count >= MAX_UTXOS) return -1;
-    utxos->set[utxos->count++] = *utxo;
-    return 0;
-}
-
-/* 删除 */
-int utxo_set_remove(UTXOSet* utxos, const uint8_t txid[TXID_LEN], uint32_t vout) {
-    if (!utxos || !txid) return -1;
-    for (size_t i = 0; i < utxos->count; i++) {
-        if (memcmp(utxos->set[i].txid, txid, TXID_LEN) == 0 &&
-            utxos->set[i].vout == vout) {
-            utxos->set[i] = utxos->set[utxos->count - 1];
-            utxos->count--;
-            return 0;
+    while (cur) {
+        if (strcmp(cur->addr, addr) == 0) {
+            sum += cur->amount;
         }
+        cur = cur->next;
     }
-    return -1;
+    return sum;
 }
 
-/* 查找 */
-UTXO* utxo_set_find(UTXOSet* utxos, const uint8_t txid[TXID_LEN], uint32_t vout) {
-    if (!utxos || !txid) return NULL;
-    for (size_t i = 0; i < utxos->count; i++) {
-        if (memcmp(utxos->set[i].txid, txid, TXID_LEN) == 0 &&
-            utxos->set[i].vout == vout) {
-            return &utxos->set[i];
+// ----余额是否充足----
+int has_sufficient_balance(const UTXO* utxo_set, 
+                           const char* from_addr,
+                           uint64_t amount) 
+{
+    uint64_t bal = get_balance(utxo_set, from_addr);
+    return bal >= amount;
+}
+
+// ----添加UTXO----
+void add_utxo(UTXO** utxo_set, const unsigned char txid[32], uint32_t index, const char* addr, uint32_t amount) 
+{
+    UTXO* node = malloc(sizeof(UTXO));
+
+    if (!node) return;
+
+    memcpy(node->txid, txid, 32);
+    node->output_index = index;
+    snprintf(node->addr, sizeof(node->addr), "%s", addr); 
+    node->amount = amount;
+
+    node->next = *utxo_set;     // 新节点挂到链表头
+
+    *utxo_set = node;
+}
+
+
+// ----查询UTXO----
+UTXO* find_utxo(UTXO* utxo_set, const unsigned char txid[32], uint32_t index) 
+{
+    UTXO* cur = utxo_set;
+
+    while (cur) {
+        if (memcmp(cur->txid, txid, 32) == 0 && 
+            cur->output_index == index) 
+        {
+            return cur;
         }
+        cur = cur->next;
     }
     return NULL;
 }
 
-/* 打印 */
-void utxo_set_print(const UTXOSet* utxos) {
-    if (!utxos) return;
-    printf("===== UTXO Set (%zu entries) =====\n", utxos->count);
-    if (utxos->count == 0) {
-        printf("(empty)\n");
-        return;
-    }
-    for (size_t i = 0; i < utxos->count; i++) {
-        const UTXO* u = &utxos->set[i];
-        printf("UTXO %zu:\n", i);
-        printf("  txid  = ");
-        for (int j = 0; j < TXID_LEN; j++) printf("%02x", u->txid[j]);
-        printf("\n");
-        printf("  vout  = %u\n", u->vout);
-        printf("  value = %llu\n", (unsigned long long)u->value);
-        printf("  addr  = %s\n", u->address);
-    }
-}
 
-/*
- * 根据交易更新 UTXO 集（多输入/多输出）
- * - 删除 tx 中所有 inputs 引用的 UTXO
- * - 添加 tx 中的 outputs（vout 从 0 开始）
- */
-void utxo_set_update_from_tx(UTXOSet* utxos, const Transaction* tx) {
-    if (!utxos || !tx) return;
+// ----删除UTXO----
+void remove_utxo(UTXO** utxo_set, const unsigned char txid[32], uint32_t index) {
+    UTXO** cur = utxo_set;
 
-    /* 删除被花费的 UTXO（所有输入） */
-    for (size_t i = 0; i < tx->input_count; i++) {
-        const TxIn* in = &tx->inputs[i];
-
-        printf("Removing spent UTXO: ");
-        for (int k = 0; k < 4; k++) printf("%02x", in->txid[k]);//仅展示前四字节
-        printf(" (vout=%u)\n", in->vout);
-
-        utxo_set_remove(utxos, in->txid, in->vout);
-    }
-
-    /* 添加新的 outputs */
-    for (size_t i = 0; i < tx->output_count; i++) {
-        if (utxos->count >= MAX_UTXOS) {
-            printf("UTXO 集已满，无法添加新的输出\n");
-            break;
+    //遍历整个链表
+    while (*cur) {
+        if (memcmp((*cur)->txid, txid, 32) == 0 && (*cur)->output_index == index) 
+        {
+            // 找到节点
+            UTXO* tmp = *cur;
+            *cur = (*cur)->next;//脱链
+            free(tmp);
+            return;
         }
 
-        UTXO u = { 0 };
-        memcpy(u.txid, tx->txid, TXID_LEN);
-        u.vout = i;
-        u.value = tx->outputs[i].value;
-        strncpy(u.address, tx->outputs[i].address, ADDR_LEN - 1);
-        u.address[ADDR_LEN - 1] = '\0';
 
-        utxo_set_add(utxos, &u);
-
-        printf("Added UTXO vout=%zu value=%llu addr=%s\n",
-            i, (unsigned long long)u.value, u.address);
+        cur = &(*cur)->next;
     }
 }
 
-/* 余额统计 */
-uint64_t utxo_set_get_balance(const UTXOSet* utxos, const char* address)
+// 更新 UTXO 集
+int update_utxo_set(UTXO** utxo_set, const Tx* tx, const unsigned char txid[32]) {
+    
+    /* ---- Step 1: 删除 Inputs 对应的 UTXO ---- */
+    for (uint32_t i = 0; i < tx->input_count; i++) 
+    {
+        TxIn* in = &tx->inputs[i];
+
+        UTXO* u = find_utxo(*utxo_set, in->txid, in->output_index);
+        if (!u) {
+            printf("UTXO not found for input!\n");
+            return 0; // 输入 UTXO 不存在 → 无效交易
+        }
+        remove_utxo(utxo_set, in->txid, in->output_index);
+    }
+
+    /* ---- Step 2: 添加 Outputs 成为新的 UTXO ---- */
+    for (uint32_t i = 0; i < tx->output_count; i++) 
+    {
+        TxOut* out = &tx->outputs[i];
+        add_utxo(utxo_set, txid, i, out->addr, out->amount);
+        
+    }
+
+    return 1;
+}
+
+// ----打印UTXO----
+void print_utxo_set(const UTXO* utxo_set) {
+    const UTXO* cur = utxo_set;
+    printf("UTXO set:\n");
+    while (cur) {
+        printf("  Addr=%s, Amount=%u, TxID=", cur->addr, cur->amount);
+        for (int i = 0; i < 32; i++) {
+            printf("%02X", cur->txid[i]);
+        }
+        printf(", Index=%u\n", cur->output_index);
+        cur = cur->next;
+    }
+}
+
+// ----选币----
+int select_coins(const UTXO* utxo_set,
+                 const char* addr, 
+                 uint64_t amount, 
+                 CoinSelection* result)
 {
-    if (!utxos || !address) return 0;
-    uint64_t total = 0;
-    for (size_t i = 0; i < utxos->count; i++) {
-        if (strcmp(utxos->set[i].address, address) == 0)
-            total += utxos->set[i].value;
-    }
-    return total;
-}
+    result->count = 0;
+    result->total = 0;
+    const UTXO* cur = utxo_set;
 
-/* 选币：顺序累加 */
-int utxo_set_select(
-    const UTXOSet* utxos,
-    const char* address,
-    uint64_t amount_needed,
-    UTXO* selected,
-    size_t max_selected,
-    size_t* out_selected_count,
-    uint64_t* out_change
-) {
-    if (!utxos || !address || !selected || !out_selected_count || !out_change)
-        return -1;
+    while (cur) {
+        if (strcmp(cur->addr, addr) == 0) {
+            result->utxos[result->count++] = cur;
+            result->total += cur->amount;
 
-    uint64_t accumulated = 0;
-    size_t count = 0;
-
-    for (size_t i = 0; i < utxos->count; i++) {
-        const UTXO* u = &utxos->set[i];
-        if (strcmp(u->address, address) == 0) {
-            if (count < max_selected) {
-                selected[count++] = *u;
-                accumulated += u->value;
-                if (accumulated >= amount_needed) break;
+            if (result->total >= amount) {
+                return 1;   
             }
         }
+        cur = cur->next;
     }
 
-    if (accumulated < amount_needed) return -1;
-
-    *out_selected_count = count;
-    *out_change = accumulated - amount_needed;
-    return 0;
+    return 0; // 余额不足无法选币
 }
 
+// ----打印UTXO的id----
+/*void print_utxo_ids(const UTXO* utxo_set) {
+    const UTXO* cur = utxo_set;
 
+    printf("UTXO IDs:\n");
 
-
-
-/*
-void utxo_set_init(UTXOSet* utxos) {
-    if (!utxos) return;
-    utxos->count = 0;
-    memset(utxos->set, 0, sizeof(utxos->set));
-}
-
-int utxo_set_add(UTXOSet* utxos, const UTXO* utxo) {
-    if (!utxos || !utxo) return -1;
-    if (utxos->count >= MAX_UTXOS) return -1;
-
-    utxos->set[utxos->count++] = *utxo;
-    return 0;
-}
-
-int utxo_set_remove(UTXOSet* utxos, const uint8_t txid[TXID_LEN], uint32_t vout) {
-    if (!utxos || !txid) return -1;
-
-    for (size_t i = 0; i < utxos->count; i++) {
-        if (memcmp(utxos->set[i].txid, txid, TXID_LEN) == 0 && utxos->set[i].vout == vout) {
-            // 找到 UTXO，删除并移动最后一个元素
-            utxos->set[i] = utxos->set[utxos->count - 1];
-            utxos->count--;
-            return 0;
-        }
+    while (cur) {
+        printf("  TxID=");
+        for (int i = 0; i < 32; i++) printf("%02X", cur->txid[i]); //以 32 字节 txid 形式输出，便于比对链状态
+        printf(", Index=%u, Address=%s, Amount=%u\n",
+            cur->output_index, cur->addr, cur->amount);
+        cur = cur->next;
     }
-    return -1;  // 未找到
-}
-
-UTXO* utxo_set_find(UTXOSet* utxos, const uint8_t txid[TXID_LEN], uint32_t vout) {
-    if (!utxos || !txid) return NULL;
-
-    for (size_t i = 0; i < utxos->count; i++) {
-        if (memcmp(utxos->set[i].txid, txid, TXID_LEN) == 0 &&
-            utxos->set[i].vout == vout) {
-            return &utxos->set[i];
-        }
-    }
-    return NULL;
-}
-
-void utxo_set_print(const UTXOSet* utxos) {
-    if (!utxos) return;
-
-    printf("===== UTXO Set (%zu entries) =====\n", utxos->count);
-    if (utxos->count == 0) {
-        printf("(empty)\n");
-        return;
-    }
-
-    for (size_t i = 0; i < utxos->count; i++) {
-        const UTXO* u = &utxos->set[i];
-        printf("UTXO %zu:\n", i);
-        printf("  txid  = ");
-        for (int j = 0; j < TXID_LEN; j++) printf("%02x", u->txid[j]);
-        printf("\n");
-        printf("  vout  = %u\n", u->vout);
-        printf("  value = %llu\n", (unsigned long long)u->value);
-        printf("  addr  = %s\n", u->address);
-    }
-}
-
-//关键函数：根据交易更新 UTXO 集
-
-void utxo_set_update_from_tx(UTXOSet* utxos, const Transaction* tx)
-{
-    if (!utxos || !tx) return;
-
-    //1. 删除所有输入引用的 UTXO 
-    for (size_t i = 0; i < tx->input_count; i++) {
-        const TxIn* in = &tx->inputs[i];
-
-        printf("Removing spent UTXO: ");
-        for (int k = 0; k < 4; k++) printf("%02x", in->prev_txid[k]);
-        printf(" (vout=%u)\n", in->prev_vout);
-
-        utxo_set_remove(utxos, in->prev_txid, in->prev_vout);
-    }
-
-    //2. 添加所有输出 
-    for (size_t i = 0; i < tx->output_count; i++) {
-        if (utxos->count >= MAX_UTXOS) {
-            printf("UTXO set full, cannot add output!\n");
-            break;
-        }
-
-        UTXO u = { 0 };
-        memcpy(u.txid, tx->txid, TXID_LEN);
-        u.vout = i;
-        u.value = tx->outputs[i].value;
-        strncpy(u.address, tx->outputs[i].address, ADDR_LEN - 1);
-
-        utxo_set_add(utxos, &u);
-
-        printf("Added new UTXO: vout=%zu value=%llu addr=%s\n",
-            i, (unsigned long long)u.value, u.address);
-    }
-}
-
-//统计余额 
-uint64_t utxo_set_get_balance(const UTXOSet* utxos, const char* address)
-{
-    uint64_t total = 0;
-
-    for (size_t i = 0; i < utxos->count; i++) {
-        if (strcmp(utxos->set[i].address, address) == 0)
-            total += utxos->set[i].value;
-    }
-    return total;
-}
-
-//简单选币：从该地址的 UTXO 顺序累加直到够钱 
-int utxo_set_select(
-    const UTXOSet* utxos,
-    const char* address,
-    uint64_t amount_needed,
-    UTXO* selected,
-    size_t max_selected,
-    size_t* out_selected_count,
-    uint64_t* out_change
-) {
-    uint64_t accumulated = 0;
-    size_t count = 0;
-
-    for (size_t i = 0; i < utxos->count; i++) {
-        const UTXO* u = &utxos->set[i];
-
-        if (strcmp(u->address, address) == 0) {
-            if (count < max_selected) {
-                selected[count++] = *u;
-                accumulated += u->value;
-                if (accumulated >= amount_needed)
-                    break;
-            }
-        }
-    }
-
-    if (accumulated < amount_needed)
-        return -1;
-
-    *out_selected_count = count;
-    *out_change = accumulated - amount_needed;
-    return 0;
-}
-*/
-
-/*
-void utxo_set_update_from_tx(UTXOSet* utxos, const Transaction* tx) {
-    if (!utxos || !tx) return;
-
-    // 删除输入对应的 UTXO（花费掉的）
-    utxo_set_remove(utxos, tx->prev_txid, tx->vout);
-
-    // 添加输出到 UTXO 集（产生新的未花费输出）
-    for (size_t i = 0; i < tx->output_count; i++) {
-        if (utxos->count >= MAX_UTXOS) {
-            printf("UTXO 集已满，无法添加新的输出\n");
-            break;
-        }
-        UTXO u = { 0 };
-        memcpy(u.txid, tx->txid, TXID_LEN);
-        u.vout = i;
-        u.value = tx->outputs[i].value;
-        strncpy(u.address, tx->outputs[i].address, ADDR_LEN - 1);
-        u.address[ADDR_LEN - 1] = '\0';
-
-        utxo_set_add(utxos, &u);
-    }
-}
-
-uint64_t utxo_set_get_balance(const UTXOSet* utxos, const char* address)
-{
-    if (!utxos || !address) return 0;
-
-    uint64_t total = 0;
-
-    for (size_t i = 0; i < utxos->count; i++) {
-        const UTXO* u = &utxos->set[i];
-
-        if (strcmp(u->address, address) == 0) {
-            total += u->value;
-        }
-    }
-    return total;
-}
-
-int utxo_set_select(
-    const UTXOSet* utxos,
-    const char* address,
-    uint64_t amount_needed,
-    UTXO* selected,
-    size_t max_selected,
-    size_t* out_selected_count,
-    uint64_t* out_change
-) {
-    if (!utxos || !address || !selected || !out_selected_count || !out_change)
-        return -1;
-
-    uint64_t accumulated = 0;
-    size_t count = 0;
-
-    // 遍历所有 UTXO，寻找属于该地址的
-    for (size_t i = 0; i < utxos->count; i++) {
-        const UTXO* u = &utxos->set[i];
-
-        if (strcmp(u->address, address) == 0) {
-            if (count < max_selected) {
-                selected[count++] = *u;
-                accumulated += u->value;
-
-                if (accumulated >= amount_needed)
-                    break;
-            }
-        }
-    }
-
-    if (accumulated < amount_needed) {
-        // 金额不足
-        return -1;
-    }
-
-    *out_selected_count = count;
-    *out_change = accumulated - amount_needed;
-    return 0;
-}
-*/
+}*/

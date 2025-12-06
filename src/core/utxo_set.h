@@ -1,70 +1,55 @@
-#pragma once
-#include <stdint.h>
+#ifndef UTXO_SET_H
+#define UTXO_SET_H
 #include <stddef.h>
+#include <stdint.h>
 #include "core/transaction.h"
 
-#define MAX_UTXOS 1024
-#define ADDR_LEN 64
-
-
-
-typedef struct {
-    uint8_t txid[TXID_LEN];    // 交易ID
-    uint32_t vout;             // 输出索引
-    uint64_t value;            // 输出金额（最小单位，例如聪）
-    char address[ADDR_LEN];    // 收款地址
+// ----UTXO结构----
+typedef struct UTXONode {
+    unsigned char txid[32];     // 交易ID
+    uint32_t output_index;      // 输出索引
+    uint32_t amount;            // 交易金额
+    char addr[35];              // 收款地址
+    struct UTXONode* next;      // 下一个节点
 } UTXO;
 
-typedef struct {
+/*typedef struct {
     UTXO set[MAX_UTXOS];
     size_t count;
-} UTXOSet;
+} UTXOSet;*/
 
-/**
- * 初始化 UTXO 集
- */
-void utxo_set_init(UTXOSet* utxos);
+typedef struct {
+    const UTXO* utxos[64];      // 收集到的指针
+    int count;                  //UTXO数量
+    uint64_t total;             //总金额
+} CoinSelection;
 
-/**
- * 添加一个新的 UTXO
- * 返回 0 成功，-1 失败（空间不足）
- */
-int utxo_set_add(UTXOSet* utxos, const UTXO* utxo);
+//int Select_coins(const UTXO* utxo_set, const char* addr, uint64_t amount, CoinSelection* result);
 
-/**
- * 删除一个 UTXO
- * 根据 txid + vout 定位
- * 返回 0 成功，-1 未找到
- */
-int utxo_set_remove(UTXOSet* utxos, const uint8_t txid[TXID_LEN], uint32_t vout);
+// ----向链表头部添加一个新的 UTXO 节点----
+void add_utxo(UTXO** utxo_set, const unsigned char txid[32], uint32_t index, const char* addr, uint32_t amount);
 
-/**
- * 根据 txid + vout 查询 UTXO
- * 返回指针（可能为 NULL）
- */
-UTXO* utxo_set_find(UTXOSet* utxos, const uint8_t txid[TXID_LEN], uint32_t vout);
 
-/**
- * 打印当前 UTXO 集
- */
-void utxo_set_print(const UTXOSet* utxos);
+// ----查找 UTXO----
+UTXO* find_utxo(UTXO* utxo_set, const unsigned char txid[32], uint32_t index);
 
-// 自动更新 UTXO 集
-// 添加 outputs，删除 inputs
-void utxo_set_update_from_tx(UTXOSet* utxos, const Transaction* tx);
+// ----移除 UTXO----
+void remove_utxo(UTXO** utxo_set, const unsigned char txid[32], uint32_t index);
 
-/**
- * 查询某地址的余额（所有 UTXO 的 value 求和）
- */
-uint64_t utxo_set_get_balance(const UTXOSet* utxos, const char* address);
+// ---更新 UTXO 集----
+int update_utxo_set(UTXO** utxo_set, const Tx* tx, const unsigned char txid[32]);
 
-//选币功能
-int utxo_set_select(
-    const UTXOSet* utxos,
-    const char* address,
-    uint64_t amount_needed,
-    UTXO* selected,
-    size_t max_selected,
-    size_t* out_selected_count,
-    uint64_t* out_change
-);
+// ----打印UTXO列表----
+void print_utxo_set(const UTXO* utxo_set);
+
+// ----确认余额是否足够----
+int has_sufficient_balance(const UTXO* utxo_set, const char* from_addr, uint64_t amount);
+
+// ----选币----
+int select_coins(const UTXO* utxo_set, const char* addr, uint64_t amount, CoinSelection* result);
+
+// ----余额查询----
+uint64_t get_balance(const UTXO* utxo_set, const char* addr);
+
+#endif
+
